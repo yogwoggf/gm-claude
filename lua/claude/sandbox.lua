@@ -220,5 +220,27 @@ return {
       RemoveClientClaudeHooks()
     ]])
     net.Broadcast()
+  end,
+
+  setupDevCmd = function(self)
+    -- Dev command to re-run an arbitrary prompt (prompt-lua/<id>.txt) in the real environment for testing.
+    concommand.Add("claude_rerun_prompt", function(ply, cmd, args)
+      if not args[1] then
+        print("Please provide a prompt ID to re-run. Usage: claude_rerun_prompt <prompt_id>")
+        return
+      end
+
+      local promptId = args[1]
+      local filePath = string.format("prompt-lua/%s.txt", promptId)
+      if not file.Exists(filePath, "DATA") then
+        print("No Lua code found for prompt ID: " .. promptId)
+        return
+      end
+
+      local luaCode = file.Read(filePath, "DATA")
+      print("Re-running Lua code for prompt ID: " .. promptId)
+      print(luaCode)
+      self:run(luaCode, promptId)
+    end)
   end
 }

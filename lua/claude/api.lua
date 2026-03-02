@@ -1,6 +1,6 @@
 require("gwsockets")
----@module "lua.claude.dynamic-prompt"
-local dynamicPrompt = include("claude/dynamic-prompt.lua")
+---@module "lua.claude.routing-prompt"
+local routingPrompt = include("claude/routing-prompt.lua")
 ---@module "lua.claude.system-prompt"
 local systemPrompt = include("claude/system-prompt.lua")
 ---@module "lua.claude.tools"
@@ -8,6 +8,13 @@ local registerTools = include("claude/tools.lua")
 
 local j = util.TableToJSON
 local jt = util.JSONToTable
+
+local ROUTING_ASSISTANT_MODEL = "openai/gpt-oss-20b:nitro"
+local ROUTING_MODELS = {
+  ["simple"] = "openai/gpt-oss-20b:nitro",
+  ["medium"] = "openai/gpt-oss-120b:nitro",
+  ["complex"] = "google/gemini-3-flash-preview:nitro"
+}
 
 local function Prompt(player, prompt, api, onLuaCallback)
   return {
@@ -21,14 +28,26 @@ local function Prompt(player, prompt, api, onLuaCallback)
     onLuaCallback = onLuaCallback,
     toolCallCount = 0,
     toolCalls = {},
+    waitingForRouting = true,
     
     start = function(self)
-      -- Kicks off with RAG first, then kicks more off once we get it back from the API.
-      print("[gm-claude] Starting prompt with RAG: " .. self.prompt)
-      self.api:sendMessage("rag", {
+      print("[gm-claude] Starting prompt with routing: " .. self.prompt)
+      --[[self.api:sendMessage("rag", {
         query = self.prompt,
         playerId = tostring(self.player:UserID()),
         id = self.id
+      })]]
+
+      -- Kicks off with routing first
+      self.api:sendMessage("prompt", {
+        messages = {
+          {role = "system", content = routingPrompt},
+          {role = "user", content = self.api:formatPlayerPrompt(self.player, self.prompt)}
+        },
+        tools = {}, -- no tools for routing, just want the complexity classification
+        id = self.id,
+        model = ROUTING_ASSISTANT_MODEL,
+        priority = self.api.CURRENT_PRIORITY
       })
     end,
 
@@ -98,6 +117,52 @@ local function Prompt(player, prompt, api, onLuaCallback)
       self:send()
      end,
 
+     onRoutingResponse = function(self, response)
+      print("[gm-claude] Received routing response from API!")
+      local model
+
+      if response and response.content and #response.content > 0 then
+        local sanitizedJson = response.content:gsub("```json", ""):gsub("```", "")
+        local complexity = jt(sanitizedJson) -- should be a JSON object with a "complexity" field
+        if not complexity or not complexity.complexity then
+          print("[gm-claude] Routing assistant failed to classify complexity, defaulting to simple.")
+          model = ROUTING_MODELS["simple"]
+        else
+          model = ROUTING_MODELS[string.lower(complexity.complexity)] or ROUTING_MODELS["simple"]
+          print(string.format("[gm-claude] Routing assistant classified complexity as '%s', using model '%s'", complexity.complexity, model))
+        end
+      else
+        print("[gm-claude] Routing assistant returned empty response, defaulting to simple.")
+        model = ROUTING_MODELS["simple"]
+      end
+
+      -- kick off RAG next
+      print("[gm-claude] Now sending RAG request to API...")
+      self.model = model -- set the model for the main prompt based on routing response
+      self.api:sendMessage("rag", {
+        query = self.prompt,
+        playerId = tostring(self.player:UserID()),
+        id = self.id
+      })
+     end,
+
+     onNewEvent = function(self, event)
+      -- API routes this to our callback, so we can emulate a direct
+      -- connection between this prompt and the PAI
+      if event.type == "prompt-response" then
+        if self.waitingForRouting then
+          self.waitingForRouting = false
+          self:onRoutingResponse(event.response)
+        else
+          self:onResponse(event.response)
+        end
+      elseif event.type == "rag-response" then
+        self:onRagResponse(event.examples)
+      else
+        print("[gm-claude] Received unknown event type in prompt callback: " .. tostring(event.type))
+      end
+     end,
+
     handleToolCall = function(self, toolName, args)
       self.toolCallCount = self.toolCallCount + 1
 
@@ -157,7 +222,8 @@ return {
   state = {
     promptsInFlight = {},
     moneyLeftCallback = nil,
-    embeddingCallback = nil
+    embeddingCallback = nil,
+    allEmbeddingsCallback = nil
   },
 
   connect = function(self)
@@ -188,49 +254,37 @@ return {
   end,
 
   onMessage = function(self, data)
-    if data.type == "prompt-response" then
-      local prompt = self.state.promptsInFlight[data.id]
-      if not prompt then
-        print("[gm-claude] Received response for unknown prompt ID: " .. data.id)
-        return
-      end
-
-      prompt:onResponse(data.response)
-    elseif data.type == "credits-response" then
+    if data.type == "credits-response" then
       if self.state.moneyLeftCallback then
         self.state.moneyLeftCallback(data.totalCredits - data.totalUsed)
         self.state.moneyLeftCallback = nil
-      end
-    elseif data.type == "rag-response" then
-      local prompt = self.state.promptsInFlight[data.id]
-      if not prompt then
-        print("[gm-claude] Received RAG response for unknown prompt ID: " .. data.id)
-        return
-      end
-
-      prompt:onRagResponse(data.examples)      
+      end     
     elseif data.type == "add-embedding-response" then
       if self.state.embeddingCallback then
         self.state.embeddingCallback(data.success, data.message)
         self.state.embeddingCallback = nil
        end
+    elseif data.type == "get-all-embeddings-response" then
+      if self.state.allEmbeddingsCallback then
+        self.state.allEmbeddingsCallback(data.examples)
+        self.state.allEmbeddingsCallback = nil
+      end
     elseif data.type == "error" then
       print("[gm-claude] Received error from API: " .. data.message)
     else
+      -- Check if this is a ID-based response for an in-flight prompt
+      if data.id and self.state.promptsInFlight[data.id] then
+        local prompt = self.state.promptsInFlight[data.id]
+        prompt:onNewEvent(data)
+        return
+      end
+
       print("[gm-claude] Received message with unknown type: " .. tostring(data.type))
     end
   end,
 
   formatPlayerPrompt = function(self, player, request)
     return string.format("Player(%d): %s", player:UserID(), request)
-  end,
-
-  formatPromptIntoBody = function(self, prompt, modelOverride)
-    return {
-      playerPrompt = prompt,
-      model = modelOverride or self.CURRENT_MODEL,
-      dynamicPrompt = dynamicPrompt()
-    }
   end,
 
   parseLuaCode = function(self, code)
@@ -265,6 +319,16 @@ return {
   addLiveEmbedding = function(self, example, callback)
     self.state.embeddingCallback = callback
     self:sendMessage("add-embedding", {example = example})
+  end,
+
+  deleteEmbedding = function(self, prompt, callback)
+    self.state.embeddingCallback = callback
+    self:sendMessage("delete-embedding", {prompt = prompt})
+  end,
+
+  getAllEmbeddings = function(self, callback)
+    self.state.allEmbeddingsCallback = callback
+    self:sendMessage("get-all-embeddings", {})
   end,
 
   getMoneyLeft = function(self, callback)

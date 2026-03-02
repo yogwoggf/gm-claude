@@ -12,6 +12,7 @@ local analytics = include("claude/analytics.lua")
 local repair = include("claude/repair.lua")
 api:connect()
 repair:initialize(api, sandbox)
+sandbox:setupDevCmd()
 ---@module "lua.claude.embeddings"
 include("claude/embeddings.lua")
 embeddings.SetAPI(api)
@@ -56,7 +57,7 @@ hook.Add("PlayerSay", "claude.chat", function(ply, text)
   end
 
   if string.sub(text, 1, 2) == "!c" then
-    playerLastPromptTime[ply] = playerLastPromptTime[ply] or 0
+    playerLastPromptTime[ply] = playerLastPromptTime[ply] or -COOLDOWN
     if CurTime() - playerLastPromptTime[ply] < COOLDOWN then
       local timeLeft = math.ceil(COOLDOWN - (CurTime() - playerLastPromptTime[ply]))
       ply:ChatPrint("Please wait " .. timeLeft .. " seconds before sending another prompt.")
@@ -72,7 +73,7 @@ hook.Add("PlayerSay", "claude.chat", function(ply, text)
     print("[gm-claude] Sending analytics for prompt...")
     analytics:sendPrompt(prompt, ply)
     api:sendPrompt(ply, prompt, function(luaCode, promptId)
-      repair:add(promptId, ply, prompt, luaCode)
+      repair:add(promptId, prompt, ply, luaCode)
       ply:SendLua("ChangeClaudeStatus('idle')")
       print("[gm-claude] Received Lua code from API: " .. luaCode)
       print("[gm-claude] promptId: " .. tostring(promptId))
@@ -85,7 +86,7 @@ hook.Add("PlayerSay", "claude.chat", function(ply, text)
         ply:ChatPrint("Retrying with Gemini...")
         ply:SendLua("ChangeClaudeStatus('thinking')")
         api:sendPrompt(ply, prompt, function(geminiLuaCode, geminiPromptId)
-          repair:add(geminiPromptId, ply, prompt, geminiLuaCode)
+          repair:add(geminiPromptId, prompt, ply, geminiLuaCode)
           ply:SendLua("ChangeClaudeStatus('idle')")
           print("[gm-claude] Received Lua code from Gemini: " .. geminiLuaCode)
           local geminiSuccess, geminiErrMsg = sandbox:run(geminiLuaCode, geminiPromptId)
