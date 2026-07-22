@@ -1,7 +1,3 @@
 # gm-claude
 
-Bad name, but this is the Lua part of Gilb Land United's AI generation. Public, but not meant to be
-integrated elsewhere yet. It simply implements an agentic LLM loop with OpenRouter, stuff like fuzzy
-toolcalls and RAG to produce Lua code that is then executed in a sandbox.
-
-It allows basically for anything to be made with natural language, still in progress though.
+Garry's Mod addon for Gilb Land United (self-hostable but not documented yet). Provides a chat-based interface into an agentic LLM harness system which creates and edits Lua code in response to player prompts. The system is designed to be robust, with automatic error detection and repair, and can handle complex multi-step tasks. Essentially, allows anyone to create their own content and features within an ephemeral server session through natural language prompts.

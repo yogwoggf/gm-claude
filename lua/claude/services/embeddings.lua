@@ -39,6 +39,7 @@ if SERVER then
         example.tags = ""
         example.toolcalls = prompt.toolCalls or {}
         example.response = prompt.luaCode or ""
+        example.is_docs = false
 
         return example
     end
@@ -674,6 +675,7 @@ if CLIENT then
             tags = meta.tags,
             toolcalls = meta.toolcalls or {},
             response = code,
+            is_docs = meta.is_docs or false,
         }
     end
 

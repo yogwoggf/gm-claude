@@ -1,344 +1,107 @@
-require("gwsockets")
----@module "lua.claude.routing-prompt"
-local routingPrompt = include("claude/routing-prompt.lua")
----@module "lua.claude.system-prompt"
-local systemPrompt = include("claude/system-prompt.lua")
----@module "lua.claude.tools"
-local registerTools = include("claude/tools.lua")
-
-local j = util.TableToJSON
-local jt = util.JSONToTable
-
-local ROUTING_ASSISTANT_MODEL = "openai/gpt-oss-20b:nitro"
-local ROUTING_MODELS = {
-  ["simple"] = "openai/gpt-oss-20b:nitro",
-  ["medium"] = "openai/gpt-oss-120b:nitro",
-  ["complex"] = "google/gemini-3-flash-preview:nitro"
-}
-
-local function Prompt(player, prompt, api, onLuaCallback)
-  return {
-    id = tostring(math.random(100000, 9999999)),
-    player = player,
-    prompt = prompt,
-    api = api,
-    messages = {}, -- State of the prompt
-    model = api.CURRENT_MODEL,
-    tools = {},
-    onLuaCallback = onLuaCallback,
-    toolCallCount = 0,
-    toolCalls = {},
-    waitingForRouting = true,
-    
-    start = function(self)
-      print("[gm-claude] Starting prompt with routing: " .. self.prompt)
-      --[[self.api:sendMessage("rag", {
-        query = self.prompt,
-        playerId = tostring(self.player:UserID()),
-        id = self.id
-      })]]
-
-      -- Kicks off with routing first
-      self.api:sendMessage("prompt", {
-        messages = {
-          {role = "system", content = routingPrompt},
-          {role = "user", content = self.api:formatPlayerPrompt(self.player, self.prompt)}
-        },
-        tools = {}, -- no tools for routing, just want the complexity classification
-        id = self.id,
-        model = ROUTING_ASSISTANT_MODEL,
-        priority = self.api.CURRENT_PRIORITY
-      })
-    end,
-
-    send = function(self)
-      local jsonTools = table.Copy(self.tools)
-      for i, tool in ipairs(jsonTools) do
-        jsonTools[i] = table.Copy(tool)
-        jsonTools[i].callback = nil -- don't send the Lua callback
-      end
-
-      self.api:sendMessage("prompt", {
-        messages = self.messages,
-        tools = jsonTools,
-        id = self.id,
-        model = self.model,
-        priority = self.api.CURRENT_PRIORITY
-      })
-    end,
-
-    -- Called when the API receives a response and looks up prompt by ID to run the callback,
-    onResponse = function(self, response)
-      table.insert(self.messages, response)
-
-      -- From here, we'll either terminate the state machine and run the Lua code,
-      -- or if it wants to call a tool, we'll run the tool callback and send the result back to the API as another message in the conversation,
-      -- which kicks it off again.
-      if response.toolCalls then
-        if self.toolCallCount >= 5 then
-          table.insert(self.messages, {
-            role = "system",
-            content = "The AI has made too many tool calls (5+), this is your **last attempt**! **Please only return a Lua code block of your finished script after this!**"
-          })
-        end
-
-        for _, toolCall in ipairs(response.toolCalls) do
-          -- Tools respond with their raw content, we'll handle the message
-          local toolResult = self:handleToolCall(toolCall["function"].name, jt(toolCall["function"].arguments))
-          table.insert(self.messages, {role = "tool", toolCallId = toolCall.id, content = j(toolResult)})
-        end
-
-        self:send()
-      elseif response.content and #response.content > 0 then
-        -- No tool calls, so this must be the final response with Lua code to run
-        -- Sometimes a zero-completion will happen, we just ignore it and hope
-        -- it fixes itself.
-        local luaCode = self.api:parseResponseForLua(response.content)
-        local save = string.format("Prompt: %s\nResponse: %s", self.prompt, luaCode)
-        file.Write("prompt-lua/" .. self.id .. ".txt", save) -- write the Lua code to a file for debugging/inspection later
-        self.luaCode = luaCode
-        embeddings.SavePromptObject(self.id, self)
-        self.onLuaCallback(luaCode, self.id)
-      end
-    end,
-
-    onRagResponse = function(self, examples)
-      print("[gm-claude] Received RAG examples from API: " .. #examples)
-      print("[gm-claude] Now running...")
-
-      -- system prompt
-      table.insert(self.messages, {role = "system", content = systemPrompt})
-      local combined = "Here are some relevant examples to help you: "
-      for _, example in pairs(examples) do
-        combined = combined .. "\n" .. example -- already has ## Example and all that
-      end
-      table.insert(self.messages, {role = "system", content = combined})
-      table.insert(self.messages, {role = "user", content = self.api:formatPlayerPrompt(self.player, self.prompt)})
-      self:send()
-     end,
-
-     onRoutingResponse = function(self, response)
-      print("[gm-claude] Received routing response from API!")
-      local model
-
-      if response and response.content and #response.content > 0 then
-        local sanitizedJson = response.content:gsub("```json", ""):gsub("```", "")
-        local complexity = jt(sanitizedJson) -- should be a JSON object with a "complexity" field
-        if not complexity or not complexity.complexity then
-          print("[gm-claude] Routing assistant failed to classify complexity, defaulting to simple.")
-          model = ROUTING_MODELS["simple"]
-        else
-          model = ROUTING_MODELS[string.lower(complexity.complexity)] or ROUTING_MODELS["simple"]
-          print(string.format("[gm-claude] Routing assistant classified complexity as '%s', using model '%s'", complexity.complexity, model))
-        end
-      else
-        print("[gm-claude] Routing assistant returned empty response, defaulting to simple.")
-        model = ROUTING_MODELS["simple"]
-      end
-
-      -- kick off RAG next
-      print("[gm-claude] Now sending RAG request to API...")
-      self.model = model -- set the model for the main prompt based on routing response
-      self.api:sendMessage("rag", {
-        query = self.prompt,
-        playerId = tostring(self.player:UserID()),
-        id = self.id
-      })
-     end,
-
-     onNewEvent = function(self, event)
-      -- API routes this to our callback, so we can emulate a direct
-      -- connection between this prompt and the PAI
-      if event.type == "prompt-response" then
-        if self.waitingForRouting then
-          self.waitingForRouting = false
-          self:onRoutingResponse(event.response)
-        else
-          self:onResponse(event.response)
-        end
-      elseif event.type == "rag-response" then
-        self:onRagResponse(event.examples)
-      else
-        print("[gm-claude] Received unknown event type in prompt callback: " .. tostring(event.type))
-      end
-     end,
-
-    handleToolCall = function(self, toolName, args)
-      self.toolCallCount = self.toolCallCount + 1
-
-      for _, tool in ipairs(self.tools) do
-        if tool["function"].name == toolName then
-          local result = tool.callback(args)
-          -- Introspection for later
-          table.insert(self.toolCalls, {tool = toolName, args = args, result = result})
-          return result
-        end
-      end
-
-      print("[gm-claude] Received call for unknown tool: " .. toolName)
-      return nil
-    end,
-    
-    -- Expects an entire tool definition with a Lua callback, but basically
-    -- 1:1 with the tool definition format that the API expects, except with an added `callback` field for the Lua function to call when the tool is invoked
-    --[[
-    const tools = [
-  {
-    type: 'function',
-    function: {
-      name: 'searchGutenbergBooks',
-      description:
-        'Search for books in the Project Gutenberg library based on specified search terms',
-      parameters: {
-        type: 'object',
-        properties: {
-          search_terms: {
-            type: 'array',
-            items: {
-              type: 'string',
-            },
-            description:
-              "List of search terms to find books in the Gutenberg library (e.g. ['dickens', 'great'] to search for books by Dickens with 'great' in the title)",
-          },
-        },
-        required: ['search_terms'],
-      },
-    },
-  },
-];
-]]
-      addTool = function(self, toolDef)
-        table.insert(self.tools, toolDef)
-      end
-  }
-end
+---@module "lua.claude.services.connection"
+local Connection = include("claude/services/connection.lua")
+---@module "lua.claude.agents.planner-agent"
+local PlannerAgent = include("claude/agents/planner-agent.lua")
+---@module "lua.claude.history"
+local history = include("claude/history.lua")
+---@module "lua.claude.runtime.repair"
+local repair = include("claude/runtime/repair.lua")
 
 return {
   API_URL = "ws://claude-api:3000/",
   CURRENT_MODEL = "google/gemini-3-flash-preview:nitro",
   CURRENT_PRIORITY = "latency",
-  SOCKET = nil,
-
-  state = {
-    promptsInFlight = {},
-    moneyLeftCallback = nil,
-    embeddingCallback = nil,
-    allEmbeddingsCallback = nil
-  },
+  connection = nil,
+  sandbox = nil, -- set by the server autorun; coding agents run Lua through it
 
   connect = function(self)
-    self.SOCKET = GWSockets.createWebSocket(self.API_URL)
-
-    self.SOCKET.onMessage = function(_, msg)
-      print("[gm-claude] Received message from API: " .. msg)
-      local data = jt(msg)
-      self:onMessage(data)
-    end
-
-    self.SOCKET.onConnected = function()
-      print("[gm-claude] Successfully connected to API WebSocket.")
-    end
-
-    self.SOCKET.onDisconnected = function(_, code, reason)
-      print("[gm-claude] Disconnected from API WebSocket.")
-    end
-
-    print("[gm-claude] Attempting to connect to API WebSocket...")
-    self.SOCKET:open()
+    self.connection = Connection(self.API_URL)
+    self.connection:connect()
   end,
 
-  sendMessage = function(self, type, data)
-    local packet = data
-    data.type = type -- merged
-    self.SOCKET:write(j(packet))
-  end,
-
-  onMessage = function(self, data)
-    if data.type == "credits-response" then
-      if self.state.moneyLeftCallback then
-        self.state.moneyLeftCallback(data.totalCredits - data.totalUsed)
-        self.state.moneyLeftCallback = nil
-      end     
-    elseif data.type == "add-embedding-response" then
-      if self.state.embeddingCallback then
-        self.state.embeddingCallback(data.success, data.message)
-        self.state.embeddingCallback = nil
-       end
-    elseif data.type == "get-all-embeddings-response" then
-      if self.state.allEmbeddingsCallback then
-        self.state.allEmbeddingsCallback(data.examples)
-        self.state.allEmbeddingsCallback = nil
-      end
-    elseif data.type == "error" then
-      print("[gm-claude] Received error from API: " .. data.message)
-    else
-      -- Check if this is a ID-based response for an in-flight prompt
-      if data.id and self.state.promptsInFlight[data.id] then
-        local prompt = self.state.promptsInFlight[data.id]
-        prompt:onNewEvent(data)
-        return
-      end
-
-      print("[gm-claude] Received message with unknown type: " .. tostring(data.type))
-    end
+  -- Thin passthrough so agents can post raw messages over the shared connection.
+  sendMessage = function(self, messageType, data)
+    self.connection:send(messageType, data)
   end,
 
   formatPlayerPrompt = function(self, player, request)
     return string.format("Player(%d): %s", player:UserID(), request)
   end,
 
-  parseLuaCode = function(self, code)
-    -- It can sometimes get confused and make a ```lua block
-    code = code:gsub("```lua", "")
-    code = code:gsub("```", "")
-    return code
-  end,
-
-  parseResponseForLua = function(self, response)
-    if response then
-      return self:parseLuaCode(response)
-    end
-
-    return nil
-  end,
-
-  --- Sends a prompt to the API and returns the response via callback
-  --- @param prompt string Prompt to send to the API
-  --- @param callback fun(luaCode: string, promptId: string) Callback function that receives the Lua code and prompt ID.
-  sendPrompt = function(self, player, prompt, callback, modelOverride)
-    local newPrompt = Prompt(player, prompt, self, function(luaCode, promptId)
-      self.state.promptsInFlight[promptId] = nil -- clear prompt from in-flight state
-      callback(luaCode, promptId)
+  --- Registers an agent on the connection and starts it, cleaning up its handler
+  --- when it finishes. onComplete receives (result, agent). Used both for the
+  --- top-level planner and for coding agents spawned by the dispatch tool.
+  launchAgent = function(self, agent, onComplete)
+    self.connection:registerHandler(agent.id, function(event)
+      agent:onEvent(event)
     end)
 
-    self.state.promptsInFlight[newPrompt.id] = newPrompt
-    registerTools(newPrompt) -- register tools for this prompt
-    newPrompt:start() -- kick off the CoT state machine for this prompt
+    agent.onComplete = function(result, ag)
+      self.connection:unregisterHandler(ag.id) -- stream is done, stop routing events to it
+      if onComplete then
+        onComplete(result, ag)
+      end
+    end
+
+    agent:start()
   end,
-  
+
+  --- Runs a prompt through the entire pipeline. Callback is called once
+  --- the planner and all coding agents have finished.
+  --- @param callback fun(result: any, promptId: string)
+  --- @param opts table|nil { promptId?: string, editContext?: table }
+  sendPrompt = function(self, player, prompt, callback, opts)
+    opts = opts or {}
+    local planner = PlannerAgent.new({
+      api = self,
+      player = player,
+      prompt = prompt,
+      promptId = opts.promptId,
+      editContext = opts.editContext,
+    })
+
+    local label = opts.editContext and opts.editContext.originalPrompt or prompt
+    history:begin(player, planner.promptId, label)
+    repair:register(planner.promptId, player)
+
+    self:launchAgent(planner, function(result, agent)
+      history:finish(agent.promptId)
+      callback(result, agent.promptId)
+    end)
+  end,
+
   addLiveEmbedding = function(self, example, callback)
-    self.state.embeddingCallback = callback
-    self:sendMessage("add-embedding", {example = example})
+    self.connection:request("add-embedding", {example = example}, "add-embedding-response", function(data)
+      callback(data.success, data.message)
+    end)
   end,
 
   deleteEmbedding = function(self, prompt, callback)
-    self.state.embeddingCallback = callback
-    self:sendMessage("delete-embedding", {prompt = prompt})
+    -- Callers may fire-and-forget; only queue a waiter when they actually want the result.
+    if callback then
+      self.connection:request("delete-embedding", {prompt = prompt}, "add-embedding-response", function(data)
+        callback(data.success, data.message)
+      end)
+    else
+      self.connection:send("delete-embedding", {prompt = prompt})
+    end
   end,
 
   getAllEmbeddings = function(self, callback)
-    self.state.allEmbeddingsCallback = callback
-    self:sendMessage("get-all-embeddings", {})
+    self.connection:request("get-all-embeddings", {}, "get-all-embeddings-response", function(data)
+      callback(data.examples)
+    end)
   end,
 
   getMoneyLeft = function(self, callback)
-    if not self.SOCKET then
+    if not self.connection or not self.connection:isConnected() then
       print("[gm-claude] Cannot get money left: WebSocket is not connected.")
       callback(nil)
       return
     end
 
-    self:sendMessage("get-credits", {})
-    self.state.moneyLeftCallback = callback
+    self.connection:request("get-credits", {}, "credits-response", function(data)
+      callback(data.totalCredits - data.totalUsed)
+    end)
   end,
 }

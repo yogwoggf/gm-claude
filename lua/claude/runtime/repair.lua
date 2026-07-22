@@ -13,7 +13,6 @@ repair.REPAIR_COOLDOWN = 60  -- min seconds between repair passes for one prompt
 repair.api = nil
 repair.sandbox = nil
 
---- Used so that the mock harness can intercept all errors by a prompt.
 function repair:setInterceptor(promptId, fn)
   self.interceptors[promptId] = fn
 end
@@ -39,9 +38,7 @@ function repair:isAi(chunkName)
   return chunkName ~= nil and self.prompts[chunkName] ~= nil
 end
 
---- The single entry point for every runtime error, from any source/realm. Buckets
---- by error string (so the same failing site counts up rather than flooding), keeps
---- the richest detail seen for it, and triggers a repair once it proves persistent.
+--- The single entry point for every runtime error, from any source/realm.
 --- @param promptId string chunk name / creation id the error was attributed to
 --- @param realm string "server" | "client"
 --- @param errString string the raw error message (bucket key)
@@ -59,9 +56,9 @@ function repair:reportError(promptId, realm, errString, detail)
   end
 
   local b = self.buckets[promptId]
-  if not b then b = {} self.buckets[promptId] = b end
+  if not b then b = {}; self.buckets[promptId] = b end
   local entry = b[errString]
-  if not entry then entry = { count = 0 } b[errString] = entry end
+  if not entry then entry = { count = 0 }; b[errString] = entry end
 
   entry.count = entry.count + 1
   entry.realm = realm
@@ -75,8 +72,7 @@ function repair:reportError(promptId, realm, errString, detail)
   end
 end
 
---- The live code for a promptId, shaped as an editContext so a fix coder edits in
---- place.
+--- The live code for a promptId, shaped as an editContext.
 function repair:buildEditContext(promptId, player)
   local snap = history:snapshot(promptId)
   if snap then return snap end
@@ -126,7 +122,7 @@ function repair:tryRepair(promptId, entry)
   end, { promptId = promptId, editContext = editContext })
 end
 
--- Only reached in severe cases where there is a highly complex runtime error that we can't catch.
+-- Catches any errors that somehow bubbled up to the global error handler.
 hook.Add("OnLuaError", "claude.repair", function(err, realm, stack)
   if not istable(stack) then return end
   for _, frame in ipairs(stack) do

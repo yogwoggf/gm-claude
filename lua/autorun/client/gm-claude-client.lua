@@ -1,30 +1,178 @@
-include("claude/mount.lua")
-include("claude/embeddings.lua")
+include("claude/services/mount.lua")
+include("claude/services/embeddings.lua")
+include("claude/tests.lua")
+
+-- Chunk names (promptIds) of AI-generated code this client has run, so the error
+-- reporters can tell which errors are ours and worth siphoning to the server. The
+-- server threads the promptId alongside the code (see sandbox.lua).
+local claudePromptIds = {}
+-- The promptId currently being executed, so callbacks registered during the run are
+-- wrapped with the id that owns them (they fire later, when isClaudeRunning is false).
+local currentPromptId = nil
+local isClaudeRunning = false
+
+-- ------------------------------------------------------------ error capture ----
+-- The client mirror of the server sandbox's capture: wrap the callbacks AI code
+-- registers so a deferred error inside one is caught *before the stack unwinds* —
+-- which is the only place we can read the locals — enriched, and siphoned to the
+-- server. Without this a client error only reaches the coarse OnLuaError backstop
+-- (no locals), which is why runtime repairs used to arrive with "(no detail)".
+
+local function tostringSafe(v)
+  local ok, s = pcall(tostring, v)
+  if not ok then s = "<tostring error>" end
+  if #s > 80 then s = s:sub(1, 77) .. "..." end
+  return s
+end
+
+--- Dump the locals of the failing frame(s) that live in the generated chunk. Runs
+--- inside the xpcall handler, so the values at the moment of the error are still live.
+local function snapshotLocals(promptId)
+  local out = {}
+  for level = 2, 16 do
+    local info = debug.getinfo(level, "Sln")
+    if not info then break end
+    local src = tostring(info.short_src or info.source or "")
+    if src == promptId or src:find(promptId, 1, true) then
+      local parts = {}
+      for i = 1, 40 do
+        local name, value = debug.getlocal(level, i)
+        if not name then break end
+        if name:sub(1, 1) ~= "(" then
+          parts[#parts + 1] = string.format("%s = %s", name, tostringSafe(value))
+        end
+      end
+      out[#out + 1] = string.format("line %d: %s", info.currentline or -1, table.concat(parts, ", "))
+    end
+  end
+  return table.concat(out, "\n")
+end
+
+-- Siphon a clientside error (with detail) back to the server. A client error
+-- otherwise never leaves the client, so the server and the repair loop would never
+-- learn the code failed for players. Rate-limited per (promptId, error).
+local lastClientErrorReport = {}
+local CLIENT_ERROR_MIN_INTERVAL = 1
+local function reportClientError(promptId, err, detail)
+  if not promptId or not claudePromptIds[promptId] then return end
+  local key = promptId .. "\0" .. tostring(err)
+  if (lastClientErrorReport[key] or 0) + CLIENT_ERROR_MIN_INTERVAL > CurTime() then return end
+  lastClientErrorReport[key] = CurTime()
+
+  net.Start("claude.clienterror")
+  net.WriteString(promptId)
+  net.WriteString(tostring(err))
+  net.WriteString(detail or "")
+  net.SendToServer()
+end
+
+--- Wrap a callback so a runtime error inside it is caught, enriched with a traceback
+--- + locals, and reported. Returns pass through untouched on success.
+local function wrapCallback(promptId, fn)
+  if type(fn) ~= "function" then return fn end
+  local function handler(err)
+    local okCap, detail = pcall(function()
+      local locals = snapshotLocals(promptId)
+      local trace = debug.traceback(tostring(err), 2)
+      return locals ~= "" and (trace .. "\nLocals at error:\n" .. locals) or trace
+    end)
+    reportClientError(promptId, tostring(err), okCap and detail or nil)
+    return err
+  end
+  return function(...)
+    local res = { xpcall(fn, handler, ...) }
+    if res[1] then return unpack(res, 2) end
+  end
+end
+
+-- Detour the async entry points, wrapping only what AI code registers (guarded by
+-- isClaudeRunning — the window is a single RunString, so no other addon registers
+-- inside it). Consistent with how hook.Add was already detoured here.
 local claudeHooks = {}
 local oldHookAdd = hook.Add
-local isClaudeRunning = false
 hook.Add = function(event, identifier, func)
   if isClaudeRunning then
     table.insert(claudeHooks, {event = event, identifier = identifier})
     print(string.format("[gm-claude] Registered hook during Claude execution: %s (%s)", event, identifier))
+    func = wrapCallback(currentPromptId, func)
     if event == "InitPostEntity" then
       print("[gm-claude] Warning: Claude is adding a hook to InitPostEntity. This may cause issues if not handled properly. Executing it now...")
       func()
     end
   end
-
   return oldHookAdd(event, identifier, func)
 end
 
+local function wrapRegister(orig)
+  return function(tbl, name)
+    if isClaudeRunning then
+      for k, v in pairs(tbl) do
+        if type(v) == "function" then tbl[k] = wrapCallback(currentPromptId, v) end
+      end
+    end
+    return orig(tbl, name)
+  end
+end
+weapons.Register = wrapRegister(weapons.Register)
+scripted_ents.Register = wrapRegister(scripted_ents.Register)
+
+local oldTimerCreate = timer.Create
+timer.Create = function(name, delay, reps, func, ...)
+  if isClaudeRunning then func = wrapCallback(currentPromptId, func) end
+  return oldTimerCreate(name, delay, reps, func, ...)
+end
+local oldTimerSimple = timer.Simple
+timer.Simple = function(delay, func)
+  if isClaudeRunning then func = wrapCallback(currentPromptId, func) end
+  return oldTimerSimple(delay, func)
+end
+local oldNetReceive = net.Receive
+net.Receive = function(name, func)
+  if isClaudeRunning then func = wrapCallback(currentPromptId, func) end
+  return oldNetReceive(name, func)
+end
+
 net.Receive("claude.runlua", function()
+  local code = net.ReadString()
+  local promptId = net.ReadString()
+  if promptId ~= "" then claudePromptIds[promptId] = true end
+
   ENT = {}
   SWEP = {Primary = {}, Secondary = {}} -- make sure these tables exist for SWEP code
+  currentPromptId = promptId ~= "" and promptId or nil
   isClaudeRunning = true
-  RunString(net.ReadString(), "gm-claude-remote", false)
+  -- handleError = true so a load-time error is reported through OnLuaError (and thus
+  -- siphoned to the server) instead of halting this receiver. The chunk name is the
+  -- promptId so every error — load-time or deferred — is attributable to its creation.
+  RunString(code, currentPromptId or "gm-claude-remote", true)
   isClaudeRunning = false
+  currentPromptId = nil
   ENT = nil
   SWEP = nil
   RunConsoleCommand("spawnmenu_reload")
+end)
+
+-- Backstop for errors NOT caught by a wrapper (top-level load errors, or code that
+-- reached a raw global). No locals are available this late, but forward the parsed
+-- stack so the report still carries context instead of just the message.
+hook.Add("OnLuaError", "claude.report", function(err, realm, stack)
+  if not istable(stack) then return end
+
+  local promptId
+  for _, frame in ipairs(stack) do
+    if frame.File and claudePromptIds[frame.File] then
+      promptId = frame.File
+      break
+    end
+  end
+  if not promptId then return end
+
+  local lines = { tostring(err) }
+  for _, frame in ipairs(stack) do
+    lines[#lines + 1] = string.format("  %s:%s in %s",
+      tostring(frame.File), tostring(frame.Line), tostring(frame.Function or "?"))
+  end
+  reportClientError(promptId, err, table.concat(lines, "\n"))
 end)
 
 function RemoveClientClaudeHooks()
@@ -48,6 +196,27 @@ local claudeStatus = "idle"
 local finishTime = 0
 local confettiParticles = {}
 
+-- Progress bar under the status text. There's no known max number of steps, so it's
+-- exponential: each tick from the server (one agent LLM round-trip) closes a fixed
+-- fraction of the REMAINING gap to 1 — fast at first, ever slower, never quite full.
+-- On done it snaps to 100% and fades out.
+local PROGRESS_STEP  = 0.10 -- fraction of the remaining gap each tick closes
+local PROGRESS_LERP  = 7    -- how fast the drawn bar eases toward its target
+local PROGRESS_HOLD  = 0.5  -- seconds held at full before fading
+local PROGRESS_FADE  = 1.0  -- fade-out duration
+local PROGRESS_WIDTH = 220
+local PROGRESS_HEIGHT = 4
+local progressActive  = false
+local progressTarget  = 0
+local progressDisplay = 0
+local progressDoneAt  = 0   -- CurTime() when it snapped to done; 0 while in progress
+
+net.Receive("claude.progress", function()
+  -- Ignore ticks once we've snapped to done, so a late straggler can't unsettle it.
+  if not progressActive or progressDoneAt > 0 then return end
+  progressTarget = progressTarget + (1 - progressTarget) * PROGRESS_STEP
+end)
+
 local function makeConfettiParticle(x, y, velX, velY)
   return {
     x = x,
@@ -63,7 +232,17 @@ end
 
 function ChangeClaudeStatus(newStatus)
   claudeStatus = newStatus
-  if newStatus == "idle" then
+  if newStatus == "thinking" then
+    -- New prompt: reset the bar and start filling from empty.
+    progressActive = true
+    progressTarget = 0
+    progressDisplay = 0
+    progressDoneAt = 0
+  elseif newStatus == "idle" then
+    -- Finished: snap the bar to 100% and let it fade out.
+    progressTarget = 1
+    progressDoneAt = CurTime()
+
     finishTime = CurTime() + 2
     surface.PlaySound("garrysmod/save_load" .. math.random(1, 4) .. ".wav")
     util.ScreenShake(Vector(0, 0, 0), 5, 150, 0.5, 500)
@@ -102,6 +281,10 @@ hook.Add("HUDPaint", "claude.client.hud", function()
   draw.SimpleText("gilb land united", "ChatFont", 10, 10, Color(255, 255, 255, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
   -- type !c <prompt> in chat
   draw.SimpleText("!c <prompt> in chat", "ChatFont", 10, 30, Color(250, 250, 250, 100), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+  -- current server demand tier (low = smarter models, high = faster/cheaper)
+  local demand = _G.ClaudeDemand or "low"
+  local demandColor = demand == "high" and Color(255, 170, 90, 120) or Color(150, 220, 255, 120)
+  draw.SimpleText("demand: " .. demand, "ChatFont", 10, 70, demandColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
   if moneyLeft >= 0 then
     draw.SimpleText("money left:", "ChatFont", 10, 50, Color(255, 255, 255, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
     draw.SimpleText(string.format("$%.2f", moneyLeft), "ChatFont", 90, 50, Color(0, 255, 0, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
@@ -133,6 +316,27 @@ hook.Add("HUDPaint", "claude.client.hud", function()
   if finishTime > CurTime() then
     local alpha = math.Clamp((finishTime - CurTime()) / FINISH_TEXT_DURATION, 0, 1) * 200
     draw.SimpleText("Done!", "ChatFont", x, y, Color(0, 255, 0, alpha), TEXT_ALIGN_LEFT, TEXT_ALIGN_BOTTOM)
+  end
+
+  -- Progress bar, just below the status text (which is bottom-aligned to y).
+  if progressActive then
+    -- Ease the drawn value toward the target so ticks slide in instead of jumping.
+    progressDisplay = progressDisplay + (progressTarget - progressDisplay) * math.min(1, FrameTime() * PROGRESS_LERP)
+
+    local alpha = 1
+    if progressDoneAt > 0 then
+      local since = CurTime() - progressDoneAt
+      if since > PROGRESS_HOLD then
+        alpha = math.Clamp(1 - (since - PROGRESS_HOLD) / PROGRESS_FADE, 0, 1)
+        if alpha <= 0 then progressActive = false end
+      end
+    end
+
+    local by = y + 4
+    surface.SetDrawColor(0, 0, 0, 140 * alpha)
+    surface.DrawRect(x, by, PROGRESS_WIDTH, PROGRESS_HEIGHT)
+    surface.SetDrawColor(120, 220, 255, 235 * alpha)
+    surface.DrawRect(x, by, PROGRESS_WIDTH * math.Clamp(progressDisplay, 0, 1), PROGRESS_HEIGHT)
   end
 
   -- Render all confetti particles

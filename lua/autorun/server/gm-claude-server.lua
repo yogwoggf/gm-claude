@@ -1,21 +1,28 @@
 ---@module "lua.claude.api"
 local api = include("claude/api.lua")
----@module "lua.claude.sandbox"
-local sandbox = include("claude/sandbox.lua")
----@module "lua.claude.mount"
-include("claude/mount.lua")
----@module "lua.claude.failsafes"
-include("claude/failsafes.lua")
----@module "lua.claude.analytics"
-local analytics = include("claude/analytics.lua")
----@module "lua.claude.repair"
-local repair = include("claude/repair.lua")
+---@module "lua.claude.runtime.sandbox"
+local sandbox = include("claude/runtime/sandbox.lua")
+_G.GilbSandbox = sandbox  -- exposed for tests.lua net handler
+api.sandbox = sandbox     -- coding agents run Lua through this via the run_lua tool
+---@module "lua.claude.clarify"
+local clarify = include("claude/clarify.lua") -- routes chat replies back to an agent's clarify_with_user tool
+---@module "lua.claude.history"
+local history = include("claude/history.lua") -- per-player recent creations, for !edit
+---@module "lua.claude.services.mount"
+include("claude/services/mount.lua")
+---@module "lua.claude.runtime.failsafes"
+include("claude/runtime/failsafes.lua")
+---@module "lua.claude.services.analytics"
+local analytics = include("claude/services/analytics.lua")
+---@module "lua.claude.runtime.repair"
+local repair = include("claude/runtime/repair.lua")
 api:connect()
 repair:initialize(api, sandbox)
 sandbox:setupDevCmd()
----@module "lua.claude.embeddings"
-include("claude/embeddings.lua")
+---@module "lua.claude.services.embeddings"
+include("claude/services/embeddings.lua")
 embeddings.SetAPI(api)
+include("claude/tests.lua")
 
 local function sendDir(name)
   name = name .. "/"
@@ -41,12 +48,55 @@ timer.Create("claude.moneyleft", 8, 0, function()
 end)
 
 local COOLDOWN = 30
+local TEST_MODE = false
 local playerLastPromptTime = {}
 local timeoutPlayers = {}
 
+-- Shared entry point for both a new request (!c) and an edit (!edit). Enforces the
+-- per-player cooldown, kicks the planner pipeline, and relays its closing summary.
+-- opts is forwarded to api:sendPrompt (nil for a fresh build; {promptId, editContext}
+-- for an edit). Returns true if the request was accepted, false if rate-limited.
+local function startPrompt(ply, prompt, opts)
+  playerLastPromptTime[ply] = playerLastPromptTime[ply] or -COOLDOWN
+  if CurTime() - playerLastPromptTime[ply] < COOLDOWN then
+    local timeLeft = math.ceil(COOLDOWN - (CurTime() - playerLastPromptTime[ply]))
+    ply:ChatPrint("Please wait " .. timeLeft .. " seconds before sending another prompt.")
+    return false
+  end
+  playerLastPromptTime[ply] = CurTime()
+
+  ply:ChatPrint("Sending your request to Claude...")
+  print("[gm-claude] Sending prompt to API: " .. prompt)
+  ply:SendLua("ChangeClaudeStatus('thinking')")
+  print("[gm-claude] Sending analytics for prompt...")
+  analytics:sendPrompt(prompt, ply)
+  api:sendPrompt(ply, prompt, function(result, promptId)
+    -- The planner + coding agents already executed everything via run_lua, and
+    -- the coders self-correct on errors, so there's nothing to run here anymore.
+    ply:SendLua("ChangeClaudeStatus('idle')")
+    print("[gm-claude] Prompt " .. tostring(promptId) .. " finished.")
+    if type(result) == "string" and #result > 0 then
+      net.Start("claude.chat")
+      net.WriteString(result)
+      net.Send(ply)
+    end
+  end, opts)
+  return true
+end
+
 hook.Add("PlayerSay", "claude.chat", function(ply, text)
+  -- A pending clarify_with_user question takes priority: this chat line is the
+  -- player's answer, so hand it to the waiting agent and swallow the message.
+  if clarify:consume(ply, text) then
+    net.Start("claude.chat")
+    net.WriteString("Your answer has been received. Thank you!")
+    net.Send(ply)
+    return ""
+  end
+
   -- if timed out, no!
-  if timeoutPlayers[ply] and text:sub(1, 1) == "!" then
+  timeoutPlayers[ply] = timeoutPlayers[ply] or 0
+  
     if CurTime() < timeoutPlayers[ply] then
       local timeLeft = math.ceil(timeoutPlayers[ply] - CurTime())
       ply:ChatPrint("You are timed out from using anything for another " .. timeLeft .. " seconds.")
@@ -54,53 +104,59 @@ hook.Add("PlayerSay", "claude.chat", function(ply, text)
     else
       timeoutPlayers[ply] = nil
     end
+
+  -- Don't allow anyone but me to use commands in test mode, to prevent spam while I'm developing.
+  if TEST_MODE and ply:SteamID() ~= "STEAM_0:1:104828323" and text:sub(1, 1) == "!" then
+    ply:ChatPrint("The server is currently in test mode, and commands are disabled for regular users. Please wait until testing is complete. Thanks for your understanding!")
+    return
   end
 
-  if string.sub(text, 1, 2) == "!c" then
-    playerLastPromptTime[ply] = playerLastPromptTime[ply] or -COOLDOWN
-    if CurTime() - playerLastPromptTime[ply] < COOLDOWN then
-      local timeLeft = math.ceil(COOLDOWN - (CurTime() - playerLastPromptTime[ply]))
-      ply:ChatPrint("Please wait " .. timeLeft .. " seconds before sending another prompt.")
+  if string.sub(text, 1, 5) == "!edit" then
+    -- !edit               -> list this player's recent creations
+    -- !edit <n> <change>  -> re-run creation #n with the change applied
+    local rest = string.Trim(string.sub(text, 6))
+    local recent = history:list(ply)
+
+    if rest == "" then
+      if #recent == 0 then
+        ply:ChatPrint("You have nothing to edit yet - make something with !c first.")
+      else
+        ply:ChatPrint("Your recent creations - use !edit <number> <change>:")
+        for i, rec in ipairs(recent) do
+          ply:ChatPrint(string.format("  %d. %s", i, rec.prompt))
+        end
+      end
+      return ""
+    end
+
+    local idxStr, instruction = string.match(rest, "^(%d+)%s+(.+)$")
+    local idx = tonumber(idxStr)
+    if not idx or not instruction then
+      ply:ChatPrint("Usage: !edit <number> <what to change>  (e.g. !edit 2 make more explosions). Send !edit alone to list.")
+      return ""
+    end
+
+    local rec = recent[idx]
+    if not rec then
+      ply:ChatPrint("No creation #" .. idx .. " in your recent list. Send !edit to see it.")
+      return ""
+    end
+
+    ply:ChatPrint(string.format('Editing "%s"...', rec.prompt))
+    startPrompt(ply, instruction, {
+      promptId = rec.promptId, -- reuse the id so the rebuild overwrites the original
+      editContext = {originalPrompt = rec.prompt, artifacts = rec.artifacts},
+    })
+    return ""
+  elseif string.sub(text, 1, 2) == "!c" then
+    if text:lower():find("kanye") then
+      ply:ChatPrint("Fuck you.")
+      ply:Kill()
       return
     end
-    playerLastPromptTime[ply] = CurTime()
 
     local prompt = string.Trim(string.sub(text, 3))
-
-    ply:ChatPrint("Sending your request to Claude...")
-    print("[gm-claude] Sending prompt to API: " .. prompt)
-    ply:SendLua("ChangeClaudeStatus('thinking')")
-    print("[gm-claude] Sending analytics for prompt...")
-    analytics:sendPrompt(prompt, ply)
-    api:sendPrompt(ply, prompt, function(luaCode, promptId)
-      repair:add(promptId, prompt, ply, luaCode)
-      ply:SendLua("ChangeClaudeStatus('idle')")
-      print("[gm-claude] Received Lua code from API: " .. luaCode)
-      print("[gm-claude] promptId: " .. tostring(promptId))
-      local success, errMsg = sandbox:run(luaCode, promptId)
-      if not success then
-        ply:ChatPrint("Sorry, there was an error executing the code from Claude. Check the server console for details.")
-        if errMsg then
-          ply:ChatPrint("Error details: " .. errMsg)
-        end
-        ply:ChatPrint("Retrying with Gemini...")
-        ply:SendLua("ChangeClaudeStatus('thinking')")
-        api:sendPrompt(ply, prompt, function(geminiLuaCode, geminiPromptId)
-          repair:add(geminiPromptId, prompt, ply, geminiLuaCode)
-          ply:SendLua("ChangeClaudeStatus('idle')")
-          print("[gm-claude] Received Lua code from Gemini: " .. geminiLuaCode)
-          local geminiSuccess, geminiErrMsg = sandbox:run(geminiLuaCode, geminiPromptId)
-          if not geminiSuccess then
-            ply:ChatPrint("Sorry, there was also an error executing the code from Gemini. Check the server console for details.")
-            if geminiErrMsg then
-              ply:ChatPrint("Gemini error details: " .. geminiErrMsg)
-            end
-          else
-            ply:ChatPrint("Successfully executed Gemini's response!")
-          end
-        end, "google/gemini-3-flash-preview:nitro")
-      end
-    end)
+    startPrompt(ply, prompt)
   elseif string.sub(text, 1, 6) == "!mount" then
     local addonId = string.Trim(string.sub(text, 7))
     if addonId ~= "" then
