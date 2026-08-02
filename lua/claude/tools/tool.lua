@@ -39,6 +39,7 @@ end
 --- Run the tool. done(result) must be called exactly once (Agent guards this).
 --- `agent` is the calling agent, so tools can reach its api, id, player, etc.
 function Tool:execute(args, done, agent)
+  args = args or {}
   if self.coerceArg then
     -- The model sometimes calls us with the wrong argument name. Grab whatever
     -- value it sent and put it on the key we actually expect. (Assigned after the

@@ -84,6 +84,10 @@ util.AddNetworkString("claude.runlua")
 util.AddNetworkString("claude.requestlua")
 util.AddNetworkString("claude.chat")
 
+-- Bounds on captured print output, so a debug loop can't flood the agent's context.
+local PRINT_CAPTURE_MAX_LINES = 60
+local PRINT_CAPTURE_MAX_LINE = 300
+
 local ALL_CLIENT_LUA = {}
 local CLIENT_LUA_SEND_DELAY = 3 -- helps prevent intense lag
 local playerSuspendedEnts = {}
@@ -188,6 +192,44 @@ return {
       end,
     })
 
+    -- Capture print() so the agent can SEE what its code observed, not just whether
+    -- it threw. Without this it can execute code but never inspect a trace result, an
+    -- entity, or any game state — so it cannot test its own work, and ships builds
+    -- whose main path has never been run. Still echoes to the server console.
+    env.print = function(...)
+      print(...)
+
+      local buffer = self.printBuffer
+      if not buffer or #buffer >= PRINT_CAPTURE_MAX_LINES then return end
+
+      local parts = {}
+      for i = 1, select("#", ...) do
+        parts[i] = tostring(select(i, ...))
+      end
+
+      local line = table.concat(parts, "\t")
+      if #line > PRINT_CAPTURE_MAX_LINE then
+        line = string.sub(line, 1, PRINT_CAPTURE_MAX_LINE) .. "...(truncated)"
+      end
+      buffer[#buffer + 1] = line
+    end
+    env.Msg = env.print
+    env.MsgN = env.print
+    env.PrintTable = function(tbl, indent)
+      -- Route the stock table dump through the captured print.
+      indent = indent or 0
+      if not istable(tbl) then env.print(tostring(tbl)) return end
+      local pad = string.rep("  ", indent)
+      for k, v in pairs(tbl) do
+        if istable(v) and indent < 3 then
+          env.print(pad .. tostring(k) .. ":")
+          env.PrintTable(v, indent + 1)
+        else
+          env.print(pad .. tostring(k) .. " = " .. tostring(v))
+        end
+      end
+    end
+
     -- Blacklist some bad stuff
     env.sql = nil
     env.file = nil
@@ -209,20 +251,12 @@ return {
       net.Send(ply)
     end
 
-    FindMetaTable("Player").SetUserGroup = function(ply, group)
-      -- noop to prevent Claude from breaking if it tries to change user groups
-      naughty(ply)
-    end
-
-    FindMetaTable("Player").SetNWString = function(ply, key, value)
-      -- noop to prevent errors if Claude tries to use SetNWString, which it might do if it was trained on older Lua code
-      if key == "UserGroup" then
-        naughty(ply)
-      end
-    end
-
     FindMetaTable("Player").IsAdmin = function(ply)
-      return true -- anyone can be an admin, no one can be a superadmin!
+      return true
+    end
+
+    FindMetaTable("Player").IsSuperAdmin = function(ply)
+      return true
     end
 
     local function safeCompile(code, ident, handleError)
@@ -314,7 +348,7 @@ return {
   --- @param code string Lua code to run
   --- @param promptId string Chunk name, used for error attribution
   --- @param realm string|nil "server" (default), "client", or "shared"
-  --- @return boolean success, string|nil error
+  --- @return boolean success, string|nil error, string|nil printed output from the run
   run = function(self, code, promptId, realm)
     realm = realm or "server"
 
@@ -348,10 +382,17 @@ return {
 
     setfenv(func, env)
 
+    -- Collect anything the code prints during this synchronous run, so the result
+    -- can carry it back to the agent. Deferred prints (timers, hooks) land after the
+    -- tool has already returned, so env.print guards on this being set.
+    self.printBuffer = {}
     local success, execErr = pcall(func)
+    local printed = table.concat(self.printBuffer, "\n")
+    self.printBuffer = nil
+
     if not success then
       print("[gm-claude] Error executing Lua code: " .. tostring(execErr))
-      return false, execErr
+      return false, execErr, printed
     end
 
     -- Shared: only after a clean server run do we broadcast the same code to
@@ -361,7 +402,7 @@ return {
       self:broadcastClientLua(prepared, promptId)
     end
 
-    return true
+    return true, nil, printed
   end,
 
   removeClientHooks = function(self)

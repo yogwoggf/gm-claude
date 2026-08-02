@@ -38,6 +38,7 @@ local function sendDir(name)
 end
 
 sendDir("client")
+resource.AddSingleFile("materials/glu/gilb-land-united.png")
 
 timer.Create("claude.moneyleft", 8, 0, function()
   api:getMoneyLeft(function(amount)
@@ -65,7 +66,7 @@ local function startPrompt(ply, prompt, opts)
   end
   playerLastPromptTime[ply] = CurTime()
 
-  ply:ChatPrint("Sending your request to Claude...")
+  ply:ChatPrint("Sending your request to GilbLM...")
   print("[gm-claude] Sending prompt to API: " .. prompt)
   ply:SendLua("ChangeClaudeStatus('thinking')")
   print("[gm-claude] Sending analytics for prompt...")

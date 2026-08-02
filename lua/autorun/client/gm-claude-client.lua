@@ -132,6 +132,29 @@ net.Receive = function(name, func)
   return oldNetReceive(name, func)
 end
 
+-- --------------------------------------------------------------- boot splash ----
+-- On join the screen is plain black with the logo centred. The server streams this
+-- client its backlog of Lua one chunk at a time (see the claude.requestlua handler in
+-- sandbox.lua), so "everything has run" is simply "nothing more arrived for a beat":
+-- each chunk pushes the release back, and when the wait expires the black fades out
+-- while the logo flies to its HUD corner. A hard cap releases it if the sync stalls.
+local LOGO_CORNER_X, LOGO_CORNER_Y, LOGO_CORNER_SIZE = -10, -20, 128
+local SPLASH_LOGO_FRAC = 0.7  -- centred logo size, as a fraction of screen height
+local SPLASH_HOLD      = 2    -- seconds of quiet before the splash lets go
+local SPLASH_FLIGHT    = 1.2  -- seconds spent flying to the corner / fading the black
+local SPLASH_MAX       = 30   -- seconds after spawn we release regardless of the sync
+local splashDone        = false -- true once the intro is over and the HUD is normal
+local splashReadyAt     = 0     -- CurTime() the flight starts; 0 while nothing scheduled
+local splashDeadline    = 0     -- CurTime() we release no matter what; 0 before spawn
+local splashFlightStart = 0     -- CurTime() the flight began; 0 while still on black
+
+--- Push the splash release back by the hold. Called on spawn and again for every
+--- chunk of Lua, so the countdown only runs out once the stream has gone quiet.
+local function delaySplash()
+  if splashDone or splashFlightStart > 0 then return end
+  splashReadyAt = CurTime() + SPLASH_HOLD
+end
+
 net.Receive("claude.runlua", function()
   local code = net.ReadString()
   local promptId = net.ReadString()
@@ -150,6 +173,7 @@ net.Receive("claude.runlua", function()
   ENT = nil
   SWEP = nil
   RunConsoleCommand("spawnmenu_reload")
+  delaySplash()
 end)
 
 -- Backstop for errors NOT caught by a wrapper (top-level load errors, or code that
@@ -189,12 +213,24 @@ hook.Add("InitPostEntity", "claude.client.init", function()
   print("[gm-claude] Client environment initialized. Ready to receive Lua code from the server.")
   net.Start("claude.requestlua")
   net.SendToServer()
+
+  -- Start the countdown now: if the server has no Lua for us it sends nothing at all,
+  -- and the splash would otherwise sit on black waiting for a chunk that never comes.
+  splashDeadline = CurTime() + SPLASH_MAX
+  delaySplash()
 end)
 
 local FINISH_TEXT_DURATION = 2
 local claudeStatus = "idle"
 local finishTime = 0
 local confettiParticles = {}
+
+-- Logo rainbow flourish on finish: hue spins while saturation ramps in and then
+-- back out, so the logo blooms out of white and settles back into it.
+local LOGO_RAINBOW_DURATION = 2    -- seconds the whole flourish lasts
+local LOGO_RAINBOW_SPEED    = 480  -- degrees of hue per second
+local LOGO_RAINBOW_RAMP     = 0.15 -- fraction of the duration spent fading colour in
+local logoRainbowStart = 0         -- CurTime() the flourish began; 0 while inactive
 
 -- Progress bar under the status text. There's no known max number of steps, so it's
 -- exponential: each tick from the server (one agent LLM round-trip) closes a fixed
@@ -244,6 +280,7 @@ function ChangeClaudeStatus(newStatus)
     progressDoneAt = CurTime()
 
     finishTime = CurTime() + 2
+    logoRainbowStart = CurTime()
     surface.PlaySound("garrysmod/save_load" .. math.random(1, 4) .. ".wav")
     util.ScreenShake(Vector(0, 0, 0), 5, 150, 0.5, 500)
     for i = 1, math.random(20, 70) do
@@ -258,12 +295,12 @@ local lastDotUpdate = 0
 local moneyLeft = -1
 local moneyDelta = 0
 local moneyDeltaShowTime = 0
-local moneyDeltaY = 50
+local moneyDeltaY = 115
 
 function SetMoneyLeft(amount)
   moneyDelta = amount - moneyLeft
   moneyDeltaShowTime = CurTime() + 3
-  moneyDeltaY = 50
+  moneyDeltaY = 115
 
   moneyLeft = amount
 
@@ -277,17 +314,84 @@ function SetMoneyLeft(amount)
   end
 end
 
+local logoMat = Material("glu/gilb-land-united.png", "smooth")
+
+--- Where the logo belongs this frame, plus how opaque the black behind it is.
+--- Returns x, y, size, blackness (0-1). Advances the splash and retires it when done.
+local function logoPlacement()
+  if splashDone then return LOGO_CORNER_X, LOGO_CORNER_Y, LOGO_CORNER_SIZE, 0 end
+
+  -- On a live reload InitPostEntity never fires again, so arm the timers here too —
+  -- the first painted frame is the latest point the splash can safely start from.
+  if splashDeadline == 0 then
+    splashDeadline = CurTime() + SPLASH_MAX
+    delaySplash()
+  end
+
+  -- Sized off screen height so it fills the same amount of the screen at any res.
+  local splashSize = ScrH() * SPLASH_LOGO_FRAC
+  local centreX = ScrW() * 0.5 - splashSize * 0.5
+  local centreY = ScrH() * 0.5 - splashSize * 0.5
+
+  if splashFlightStart == 0 then
+    local due = splashReadyAt > 0 and CurTime() >= splashReadyAt
+    local expired = splashDeadline > 0 and CurTime() >= splashDeadline
+    if not (due or expired) then
+      return centreX, centreY, splashSize, 1
+    end
+    splashFlightStart = CurTime()
+  end
+
+  local frac = (CurTime() - splashFlightStart) / SPLASH_FLIGHT
+  if frac >= 1 then
+    splashDone = true
+    return LOGO_CORNER_X, LOGO_CORNER_Y, LOGO_CORNER_SIZE, 0
+  end
+
+  -- Smoothstep, so the logo leaves the centre and lands in the corner without a jolt.
+  local eased = frac * frac * (3 - 2 * frac)
+  return Lerp(eased, centreX, LOGO_CORNER_X),
+         Lerp(eased, centreY, LOGO_CORNER_Y),
+         Lerp(eased, splashSize, LOGO_CORNER_SIZE),
+         1 - eased
+end
+
+local function drawLogo(x, y, size)
+  surface.SetMaterial(logoMat)
+  local logoColor = color_white
+  if logoRainbowStart > 0 then
+    local frac = (CurTime() - logoRainbowStart) / LOGO_RAINBOW_DURATION
+    if frac >= 1 then
+      logoRainbowStart = 0
+    else
+      -- Saturation eases up over the first slice, then back down over the rest,
+      -- so both ends of the flourish meet plain white with no pop.
+      local sat
+      if frac < LOGO_RAINBOW_RAMP then
+        sat = frac / LOGO_RAINBOW_RAMP
+      else
+        sat = 1 - (frac - LOGO_RAINBOW_RAMP) / (1 - LOGO_RAINBOW_RAMP)
+      end
+      local hue = ((CurTime() - logoRainbowStart) * LOGO_RAINBOW_SPEED) % 360
+      logoColor = HSVToColor(hue, math.Clamp(sat, 0, 1), 1)
+    end
+  end
+  surface.SetDrawColor(logoColor.r, logoColor.g, logoColor.b, 255)
+  surface.DrawTexturedRect(x, y, size, size)
+end
+
 hook.Add("HUDPaint", "claude.client.hud", function()
-  draw.SimpleText("gilb land united", "ChatFont", 10, 10, Color(255, 255, 255, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+  local logoX, logoY, logoSize, black = logoPlacement()
+
   -- type !c <prompt> in chat
-  draw.SimpleText("!c <prompt> in chat", "ChatFont", 10, 30, Color(250, 250, 250, 100), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+  draw.SimpleText("!c <prompt> in chat", "ChatFont", 10, 75, Color(250, 250, 250, 100), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
   -- current server demand tier (low = smarter models, high = faster/cheaper)
   local demand = _G.ClaudeDemand or "low"
   local demandColor = demand == "high" and Color(255, 170, 90, 120) or Color(150, 220, 255, 120)
-  draw.SimpleText("demand: " .. demand, "ChatFont", 10, 70, demandColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+  draw.SimpleText("demand: " .. demand, "ChatFont", 10, 95, demandColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
   if moneyLeft >= 0 then
-    draw.SimpleText("money left:", "ChatFont", 10, 50, Color(255, 255, 255, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
-    draw.SimpleText(string.format("$%.2f", moneyLeft), "ChatFont", 90, 50, Color(0, 255, 0, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    draw.SimpleText("money left:", "ChatFont", 10, 115, Color(255, 255, 255, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    draw.SimpleText(string.format("$%.2f", moneyLeft), "ChatFont", 90, 115, Color(0, 255, 0, 120), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
     -- If it goes down, show a little funny -$x text that fades out
     if moneyDelta < 0 and CurTime() < moneyDeltaShowTime then
       local alpha = math.Clamp((moneyDeltaShowTime - CurTime()) / 3, 0, 1) * 255
@@ -357,4 +461,12 @@ hook.Add("HUDPaint", "claude.client.hud", function()
       surface.DrawTexturedRectRotated(p.x, p.y, p.size, p.size, p.rotation)
     end
   end
+
+  -- The splash curtain goes over the HUD chrome above, so that chrome fades in as the
+  -- black lifts. The logo rides on top of the curtain the whole way to its corner.
+  if black > 0 then
+    surface.SetDrawColor(0, 0, 0, 255 * black)
+    surface.DrawRect(0, 0, ScrW(), ScrH())
+  end
+  drawLogo(logoX, logoY, logoSize)
 end)
