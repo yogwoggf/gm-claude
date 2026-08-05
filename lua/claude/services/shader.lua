@@ -63,6 +63,7 @@ net.Receive("claude.shader.probe.result", function(_, ply)
     spread = net.ReadFloat(),
     blown = net.ReadFloat(),
     black = net.ReadFloat(),
+    magenta = net.ReadFloat(),
   }
   local cb = probes[hash]
   probes[hash] = nil
@@ -496,6 +497,9 @@ function S.Draw(mat, seconds, needsDepth, drawHook)
   end
 
   local function paint()
+    -- The playbook's slot layout, so a test shader that rebuilds the camera ray
+    -- gets valid inputs instead of normalising a zero vector into NaN.
+    S.SetStandardConstants(mat)
     render.UpdateScreenEffectTexture()
     render.SetMaterial(mat)
     -- No cam.Start2D here: render.* draws in worldspace and the VMT's
@@ -742,9 +746,17 @@ local function luminance(p)
   return (0.299 * p[1] + 0.587 * p[2] + 0.114 * p[3]) / 255
 end
 
+-- The playbook mandates pure magenta as the "no depth data" guard, so it is a
+-- signal rather than a colour a shader would pick. Counted separately because the
+-- guard fires on every pixel it touches, which reads as perfectly flat output and
+-- would otherwise be reported as "your noise is featureless".
+local function isGuardMagenta(p)
+  return p[1] >= 250 and p[2] <= 8 and p[3] >= 250
+end
+
 local function compare(base, shaded)
   local n = #shaded
-  local changed, blown, black = 0, 0, 0
+  local changed, blown, black, magenta = 0, 0, 0, 0
   local sum, sumSq, counted = 0, 0, 0
   local baseSum = 0
 
@@ -763,6 +775,7 @@ local function compare(base, shaded)
       sum, sumSq, counted = sum + l, sumSq + l * l, counted + 1
       if s[1] >= 250 and s[2] >= 250 and s[3] >= 250 then blown = blown + 1 end
       if s[1] <= 4 and s[2] <= 4 and s[3] <= 4 then black = black + 1 end
+      if isGuardMagenta(s) then magenta = magenta + 1 end
     end
   end
 
@@ -775,6 +788,7 @@ local function compare(base, shaded)
     spread = math.sqrt(math.max(sumSq / denom - mean * mean, 0)),
     blown = blown / denom,
     black = black / denom,
+    magenta = magenta / denom,
   }
 end
 
@@ -859,6 +873,7 @@ hook.Add("PostRender", "claude.shader.probe", function()
   net.WriteFloat(stats.spread)
   net.WriteFloat(stats.blown)
   net.WriteFloat(stats.black)
+  net.WriteFloat(stats.magenta)
   net.SendToServer()
 end)
 

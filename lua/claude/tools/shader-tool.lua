@@ -28,7 +28,18 @@ local function verdict(s, usage)
       "These numbers describe the object, not the screen."
   end
 
-  if s.changed < 0.005 then
+  -- Checked FIRST. The guard fires on every pixel it touches, so the output is
+  -- perfectly uniform and every test below would describe it as flat noise —
+  -- sending the model off to rewrite maths that never executed.
+  if (s.magenta or 0) > 0.3 then
+    parts[#parts + 1] = "PROBLEM: the effect is mostly pure magenta, which is the " ..
+      "'no depth data' guard, not a colour you chose. The depth sampler is not returning " ..
+      "depth, so your shader returned from the guard and NOTHING after it ran. Two causes, " ..
+      "check both: compile_shader needs scene_depth = true (that is what binds sampler s1 - " ..
+      "an unbound sampler reads the error checkerboard), AND your Lua needs a NeedsDepthPass " ..
+      "hook returning true (that is what fills the buffer). You need both. Do not change the " ..
+      "rest of the shader - none of it has run yet."
+  elseif s.changed < 0.005 then
     parts[#parts + 1] = isScreen
       and ("PROBLEM: INVISIBLE - the frame is unchanged. Usual causes: alpha < 1, " ..
            "returning TexBase unmodified, an early return that always fires, or a " ..
@@ -62,6 +73,34 @@ end
 -- dynamic combos". Surfacing the count is the only feedback the model gets.
 -- Provisional: tighten once a working/failing pair has been measured in-game.
 local INSTRUCTION_WARN = 4000
+
+-- Samplers are bound in the VMT at COMPILE time - screenspace_general gates
+-- EnableTexture/BindTexture on the param existing there. Sampling one that was
+-- never bound reads the purple/black error checkerboard, which compiles clean
+-- and mounts clean, so nothing catches it until it is on screen. Caught here
+-- instead: the source and the arguments are both in hand.
+local SAMPLERS = {
+  {slot = 1, param = "texture1", depth = true},
+  {slot = 2, param = "texture2"},
+  {slot = 3, param = "texture3"},
+}
+
+local function declaresSampler(source, slot)
+  return string.find(source, "register%s*%(%s*[sS]" .. slot .. "%s*%)") ~= nil
+end
+
+--- Slots the shader samples but nothing binds.
+local function unboundSamplers(source, sceneDepth, textures)
+  local missing = {}
+  for _, s in ipairs(SAMPLERS) do
+    if declaresSampler(source, s.slot) then
+      local bound = textures and textures[s.param] and textures[s.param] ~= ""
+      if s.depth and sceneDepth then bound = true end
+      if not bound then missing[#missing + 1] = s end
+    end
+  end
+  return missing
+end
 
 local LOG_DIR = "prompt-lua"
 
@@ -191,6 +230,27 @@ return Tool.new({
       return
     end
 
+    local unbound = unboundSamplers(source, args.scene_depth, args.textures)
+    if #unbound > 0 then
+      local parts = {}
+      for _, s in ipairs(unbound) do
+        parts[#parts + 1] = s.depth
+          and ("Sampler s1 is declared in your HLSL but nothing binds it. If you meant to " ..
+               "read scene depth, pass scene_depth = true. If you meant a texture, pass " ..
+               "textures = {texture1 = \"...\"}.")
+          or string.format(
+               "Sampler s%d is declared in your HLSL but nothing binds it. Pass " ..
+               "textures = {%s = \"...\"}.", s.slot, s.param)
+      end
+      parts[#parts + 1] = "Samplers are bound at COMPILE time - screenspace_general only " ..
+        "enables a sampler whose param exists in the VMT, so binding one from Lua later is " ..
+        "silently ignored. An unbound sampler reads the purple/black error checkerboard: any " ..
+        "guard you wrote against it fires across half the screen and the rest of the shader " ..
+        "never runs. Adding the NeedsDepthPass hook in Lua does NOT bind the sampler."
+      done({success = false, error = table.concat(parts, " ")})
+      return
+    end
+
     -- model/mesh shaders are geometry, and a vertex shader cannot be built for
     -- ps_3_0-only features; the guide's model path is all ps_2_b.
     S.Compile(name, source, {
@@ -228,9 +288,19 @@ return Tool.new({
       end
 
       local instructions = tonumber(result.instructions)
-      local warning = nil
+      local warnings = {}
+
+      -- Harmless to render, but the depth pass costs a whole extra render of the
+      -- scene, so paying for it and never sampling it is always a mistake.
+      if args.scene_depth and not declaresSampler(source, 1) then
+        warnings[#warnings + 1] = "You passed scene_depth = true but your HLSL declares no " ..
+          "sampler on register(s1), so the depth buffer is bound and never read. Either " ..
+          "sample it or drop scene_depth - it forces the engine to render the whole scene " ..
+          "a second time."
+      end
+
       if instructions and instructions > INSTRUCTION_WARN then
-        warning = string.format(
+        warnings[#warnings + 1] = string.format(
           "This shader is %d instructions. A shader this large usually means a loop was " ..
           "UNROLLED — check that every loop over ~6 iterations is marked [loop] and not " ..
           "[unroll], and that you passed ver=\"30\" (ps_2_b cannot do [loop]). A correctly " ..
@@ -239,6 +309,7 @@ return Tool.new({
           "likely fail in-game with 'Failed to create dynamic combos'.",
           instructions)
       end
+      local warning = #warnings > 0 and table.concat(warnings, " ") or nil
 
       S.Send(result.hash, nil, function(who, mounted, err)
         if not mounted then

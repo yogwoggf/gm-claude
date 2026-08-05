@@ -1,5 +1,8 @@
 include("claude/services/mount.lua")
 include("claude/services/shader.lua")
+include("claude/services/chatbox.lua")
+---@module "lua.claude.runtime.error-capture"
+local capture = include("claude/runtime/error-capture.lua")
 
 -- Chunk names (promptIds) of AI-generated code this client has run, so the error
 -- reporters can tell which errors are ours and worth siphoning to the server. The
@@ -11,42 +14,6 @@ local currentPromptId = nil
 local isClaudeRunning = false
 
 -- ------------------------------------------------------------ error capture ----
--- The client mirror of the server sandbox's capture: wrap the callbacks AI code
--- registers so a deferred error inside one is caught *before the stack unwinds* —
--- which is the only place we can read the locals — enriched, and siphoned to the
--- server. Without this a client error only reaches the coarse OnLuaError backstop
--- (no locals), which is why runtime repairs used to arrive with "(no detail)".
-
-local function tostringSafe(v)
-  local ok, s = pcall(tostring, v)
-  if not ok then s = "<tostring error>" end
-  if #s > 80 then s = s:sub(1, 77) .. "..." end
-  return s
-end
-
---- Dump the locals of the failing frame(s) that live in the generated chunk. Runs
---- inside the xpcall handler, so the values at the moment of the error are still live.
-local function snapshotLocals(promptId)
-  local out = {}
-  for level = 2, 16 do
-    local info = debug.getinfo(level, "Sln")
-    if not info then break end
-    local src = tostring(info.short_src or info.source or "")
-    if src == promptId or src:find(promptId, 1, true) then
-      local parts = {}
-      for i = 1, 40 do
-        local name, value = debug.getlocal(level, i)
-        if not name then break end
-        if name:sub(1, 1) ~= "(" then
-          parts[#parts + 1] = string.format("%s = %s", name, tostringSafe(value))
-        end
-      end
-      out[#out + 1] = string.format("line %d: %s", info.currentline or -1, table.concat(parts, ", "))
-    end
-  end
-  return table.concat(out, "\n")
-end
-
 -- Siphon a clientside error (with detail) back to the server. A client error
 -- otherwise never leaves the client, so the server and the repair loop would never
 -- learn the code failed for players. Rate-limited per (promptId, error).
@@ -65,23 +32,13 @@ local function reportClientError(promptId, err, detail)
   net.SendToServer()
 end
 
---- Wrap a callback so a runtime error inside it is caught, enriched with a traceback
---- + locals, and reported. Returns pass through untouched on success.
+capture.setSink(function(promptId, _, err, detail)
+  reportClientError(promptId, err, detail)
+end)
+
+--- The realm is fixed here, so the call sites below stay two-argument.
 local function wrapCallback(promptId, fn)
-  if type(fn) ~= "function" then return fn end
-  local function handler(err)
-    local okCap, detail = pcall(function()
-      local locals = snapshotLocals(promptId)
-      local trace = debug.traceback(tostring(err), 2)
-      return locals ~= "" and (trace .. "\nLocals at error:\n" .. locals) or trace
-    end)
-    reportClientError(promptId, tostring(err), okCap and detail or nil)
-    return err
-  end
-  return function(...)
-    local res = { xpcall(fn, handler, ...) }
-    if res[1] then return unpack(res, 2) end
-  end
+  return capture.wrap(promptId, "client", fn)
 end
 
 -- Detour the async entry points, wrapping only what AI code registers (guarded by

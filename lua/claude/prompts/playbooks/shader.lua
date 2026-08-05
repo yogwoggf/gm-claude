@@ -615,13 +615,21 @@ return float4(saturate(col), 1.0);
 ```
 
 ## Reading scene depth — how far away the world is
-Pass `scene_depth = true` to `compile_shader` and the scene's depth buffer is bound to **sampler s1**. This is what lets a volumetric effect stop at a wall, or a fog shader thicken with distance.
+This is what lets a volumetric effect stop at a wall, or a fog shader thicken with distance.
 
-**Your Lua must enable the depth pass, or the texture stays blank:**
-```lua
-hook.Add("NeedsDepthPass", "my_shader_depth", function() return true end)
+**Reading depth takes THREE things and they are useless apart.** Two of them are not in the shader, which is why this is the most common way to ship a broken depth effect:
+
 ```
-Remove that hook when you remove the effect. It is not free — enabling it makes the engine render the whole scene a second time with the DepthWrite shader.
+1. compile_shader argument:  scene_depth = true      <- BINDS sampler s1
+2. HLSL:                     sampler TexDepth : register(s1);
+3. Lua, in your draw file:   hook.Add("NeedsDepthPass", "my_shader_depth", function() return true end)
+```
+
+Miss **1** and the sampler is never bound. Samplers are bound at compile time — `screenspace_general` only enables one whose param exists in the VMT, so nothing you do from Lua can fix it. An unbound sampler reads the **purple/black error checkerboard**, and your guard below fires on every black square while the real shader never runs. Adding the hook does not bind anything.
+
+Miss **3** and the sampler is bound to a buffer nothing filled, so every read is 0.
+
+Remove the hook when you remove the effect. It is not free — it makes the engine render the whole scene a second time with the DepthWrite shader.
 
 **Make a blank depth buffer announce itself.** This is the worst failure mode on this page: with no depth pass every sample reads 0, every derived position collapses onto the eye, every difference is zero, and the shader returns the frame untouched. A broken depth binding and a flawless shader look **exactly the same on screen**. So start every depth shader with a guard that cannot be mistaken for success:
 ```hlsl
@@ -752,6 +760,58 @@ render.PushRenderTarget(rt) ... render.PopRenderTarget()
 matBlur:SetTexture("$basetexture", rt)
 ```
 This is real but it is roughly double the work — only reach for it if the request specifically demands clean output.
+
+### Screen-space reflections — read this before writing one
+SSR can only reflect **what is already on the screen**. There is no other data. That single fact decides whether the request is achievable:
+
+- A floor reflects what is *above* it. When the camera looks down at a floor, the things above it are behind the camera or off the top of the frame — **not on screen**. On an open map the reflected ray finds sky and there is nothing to show. This is correct behaviour, not a bug, and no amount of tuning fixes it.
+- SSR pays off looking *along* a wet street or floor toward buildings, props and walls that are themselves visible.
+
+So for **"make everything shiny/wet"**, SSR alone will look like nothing happened. Do this instead, and add SSR only on top if the request explicitly says reflections:
+```hlsl
+// Fresnel-weighted sheen. Always visible, costs ~10 instructions, no march.
+float  f     = pow(1.0 - saturate(dot(n, -viewRay)), 4.0);   // grazing = bright
+float3 sheen = skyColour * f * 0.6 + spec * pow(saturate(dot(reflected, sunDir)), 64.0);
+col += sheen;
+```
+
+If you do march, five rules. The first two are what separate a working SSR from a blotchy one.
+
+**1. Step proportionally to depth, never a fixed world distance.** `travel = k * 18.0` looks even in the world and is wildly uneven on screen: 18 units is dozens of pixels up close (so the ray leaps straight over thin geometry — this is what produces **gaps and holes** in the reflection) and sub-pixel far away (dozens of samples wasted in one texel). Grow the step with the sample's own depth so the screen-space rate stays constant:
+```hlsl
+float t = 8.0;
+[loop] for (int k = 0; k < 40; k++)
+{
+    float3 q      = p + refl * t;
+    float  qDepth = dot(q - C0.xyz, C1.xyz);
+    // ... project, sample, test ...
+    t += max(qDepth * 0.02, 4.0);   // ~constant pixels per step
+}
+```
+
+**2. Reflections DIE at steep viewing angles, and that is geometry, not a bug.** A floor's reflected ray tends toward `tan(2 x viewAngle)` on screen; past ~45° below horizontal it points **behind the camera**, where no screen data exists. So reflections fade out as the player looks down or walks up to a surface. Do not fight it — detect it and cross-fade, or the reflection pops out of existence:
+```hlsl
+// refl.z rises as the ray tips toward the camera. Fade before it leaves.
+float onScreen = saturate(1.0 - refl.z * 1.4);
+col = lerp(fallbackColour, reflectedColour, onScreen * amount);
+```
+`fallbackColour` being a sky/ambient tint is what keeps the surface reading as reflective when the march has nothing to give. Without it the effect blinks off and looks broken.
+
+**3. Never multiply your fades together.** The classic way to ship an invisible SSR: `strength 0.65 × fresnel-term 0.43 × distance-fade 0.27` lands at **7%** — mathematically alive, visually nothing. Pick ONE attenuation and floor the result:
+```hlsl
+amount = max(amount, 0.25);   // if it hits, it must be VISIBLE
+```
+
+**4. Do not fade on travel distance.** Floor hits happen at *long* travel — the ray must climb far before its depth catches the scene — so `travel / maxDistance` kills exactly the hits you get. Fade on angle (rule 2) instead.
+
+**5. Thickness needs BOTH bounds, and the march must not start on its own surface.** `rayDepth >= surfaceDepth - t` alone accepts a sample a thousand units behind the wall and smears reflections. And a first sample sitting at `travel = 0` re-finds the pixel it started from, returning that pixel's own colour — a reflection that is invisible because it is a copy:
+```hlsl
+float3 p = worldPos + n * 2.0;                  // lift off the surface
+// first sample at t > 0, never at the origin
+if (rayDepth > surfaceDepth - t && rayDepth < surfaceDepth + t * 4.0) { /* hit */ }
+```
+
+Sample the depth buffer with `tex2Dlod(TexDepth, float4(uv, 0, 0))` inside the loop — gradients are undefined in dynamic flow control.
 
 ## Depth — making a volume sit behind world geometry
 By default the pass draws over everything, so a raymarched cloud will happily cover a wall that should be in front of it. The fix is not to read the depth buffer — it is to **write** depth from the pixel shader and let the engine z-test you.
@@ -1163,10 +1223,16 @@ Always keep the result in a sane range — `saturate()` before returning if you 
 | Model colours look washed out or too dark | Missing `FinalOutput(...)` at the end of the pixel shader |
 | Geometry drawn several times per frame | Not skipping the `depthOnly` / `skybox` passes in the 3D hook |
 | Depth shader runs but changes nothing | No `NeedsDepthPass` hook, so every depth read is 0 and every difference cancels. Add the magenta guard |
+| **Blocky magenta checkerboard over the screen** | `scene_depth = true` was not passed, so s1 is unbound and reads the error checkerboard. Your guard fires on its black squares. The `NeedsDepthPass` hook does NOT bind the sampler |
+| Whole screen is flat magenta | The guard is right: s1 is bound but the buffer is empty. Missing the `NeedsDepthPass` hook |
 | **A sky/background draws over the whole world** | Drawn in `RenderScreenspaceEffects`, which runs after the world. Draw in `PostDraw2DSkyBox` instead. Depth-gating cannot fix it — geometry past 4000 units reads as sky |
 | Sky hook added, nothing appears at all | `PostDrawSkyBox` or a misspelled `PostDrawSkybox`. Only `PostDraw2DSkyBox` renders a screen quad |
 | Sky pattern slides around with the camera | Keyed off `i.uv` instead of ray direction. Map `d` to spherical coordinates |
 | AO/occlusion is invisible or barely there | Radius fixed in pixels instead of projected from world units, or the occlusion dot product using an unnormalised difference vector |
+| **SSR compiles, normals are right, and nothing appears** | Either the fades were multiplied together down to a few percent, or the reflected ray only finds sky — a floor reflects what is ABOVE it, which is off-screen when you look down. Check the maths before assuming the shader is broken |
+| **Gaps and holes in a reflection** | Fixed world-space march step. It is dozens of pixels near the camera, so the ray steps over thin geometry. Grow the step with the sample's depth |
+| **Reflections vanish as the player walks closer** | Correct geometry, not a bug: a steeper view angle sends the reflected ray behind the camera. Fade on `refl.z` and cross-fade to a fallback colour instead of letting it pop off |
+| Reflection looks like a copy of the surface itself | The march started at travel 0 and re-found its own pixel. Lift the origin along the normal and start the first sample past it |
 | Screen-space kernel crawls or boils when you move | Noise seeded with time. Screen-space filters need per-pixel-stable noise (`ign`), not per-frame |
 | Depth-derived normals are wrong at object edges | Symmetric differences straddle a silhouette; take the closer one-sided difference per axis |
 | Clouds form a vertical wall across the map | Used `p.y` as height. Source is **Z-up** |

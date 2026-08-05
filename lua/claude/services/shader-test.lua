@@ -99,6 +99,89 @@ PS_OUTPUT main(PS_INPUT i)
 }
 ]]
 
+-- Can a usable surface normal be reconstructed from the depth buffer? Every
+-- depth-derived effect (SSR, SSAO, decals, world-space fog) gates on this, and a
+-- bad normal fails SILENTLY: the shader just early-returns the untouched scene.
+--
+-- The failure it is really looking for is depth PRECISION. If the RT is 8-bit,
+-- viewDepth/4000 quantises to ~16-unit steps, so neighbouring pixels on a floor
+-- land in the same bucket and read as EQUAL depth. Equal-depth points lie on a
+-- plane perpendicular to the view axis, so the reconstructed normal collapses to
+-- -forward for the whole screen — pointing at the camera no matter what surface
+-- it is. An SSR shader gating on n.z then rejects every pixel.
+--
+--   floor pale blue (0.5,0.5,1), walls pink/green -> WORKING, normals are real
+--   one flat colour that SHIFTS AS YOU TURN        -> normals are just -forward,
+--                                                     depth precision is too coarse
+local NORMAL = HEADER .. [[
+float3 rayDir(float2 uv)
+{
+	float2 ndc = uv * 2.0 - 1.0;
+	ndc.y = -ndc.y;
+	float3 up = cross(C2.xyz, C1.xyz);
+	return normalize(C1.xyz + C2.xyz * ndc.x * C1.w + up * ndc.y * C1.w / C2.w);
+}
+
+float3 worldPos(float2 uv, float viewDepth)
+{
+	float3 d = rayDir(uv);
+	return C0.xyz + d * (viewDepth / max(dot(d, C1.xyz), 1e-3));
+}
+
+float4 main(PS_INPUT i) : COLOR
+{
+	float raw = tex2D(Tex1, i.uv).r;
+	if (raw <= 0.0) return float4(1.0, 0.0, 1.0, 1.0);   // no depth at all
+	if (raw >= 0.999) return float4(0.0, 0.0, 0.0, 1.0); // sky
+
+	float2 o = float2(0.0015, 0.0015);
+	float d  = raw * 4000.0;
+	float dL = tex2D(Tex1, i.uv - float2(o.x, 0.0)).r * 4000.0;
+	float dR = tex2D(Tex1, i.uv + float2(o.x, 0.0)).r * 4000.0;
+	float dU = tex2D(Tex1, i.uv - float2(0.0, o.y)).r * 4000.0;
+	float dD = tex2D(Tex1, i.uv + float2(0.0, o.y)).r * 4000.0;
+
+	// One-sided closer difference, as the playbook prescribes.
+	float3 p = worldPos(i.uv, d);
+	float3 dx = abs(dR - d) < abs(d - dL)
+		? worldPos(i.uv + float2(o.x, 0.0), dR) - p
+		: p - worldPos(i.uv - float2(o.x, 0.0), dL);
+	float3 dy = abs(dD - d) < abs(d - dU)
+		? worldPos(i.uv + float2(0.0, o.y), dD) - p
+		: p - worldPos(i.uv - float2(0.0, o.y), dU);
+
+	float3 n = normalize(cross(dy, dx));
+	if (dot(n, rayDir(i.uv)) > 0.0) n = -n;
+	return float4(n * 0.5 + 0.5, 1.0);
+}
+]]
+
+-- Does tex2Dlod work on the scene depth RT? Sampling inside a dynamic [loop]
+-- needs an explicit LOD (gradients are undefined in divergent flow), so every
+-- marching shader reaches for tex2Dlod — but the depth RT is created NOMIP|NOLOD,
+-- and an explicit-LOD fetch against that could have come back as zero.
+--
+-- VERIFIED GREEN: tex2Dlod agrees with tex2D on this RT, so the NOMIP|NOLOD flags
+-- do not break it and a march may sample depth freely. Kept as a regression check
+-- — if a marching depth shader ever reads nothing, re-run this before suspecting
+-- the march itself.
+--   GREEN   -> tex2Dlod agrees with tex2D. Safe to use in a march. (current)
+--   RED     -> tex2D reads depth, tex2Dlod returns nothing.
+--   BLUE    -> both read something but they disagree.
+--   magenta -> no depth at all (the binding, not the LOD)
+local LOD = HEADER .. [[
+float4 main(PS_INPUT i) : COLOR
+{
+	float a = tex2D(Tex1, i.uv).r;
+	float b = tex2Dlod(Tex1, float4(i.uv, 0.0, 0.0)).r;
+
+	if (a <= 0.001) return float4(1.0, 0.0, 1.0, 1.0);
+	if (b <= 0.001) return float4(1.0, 0.0, 0.0, 1.0);
+	if (abs(a - b) < 0.001) return float4(0.0, 1.0, 0.0, 1.0);
+	return float4(0.0, 0.3, 1.0, 1.0);
+}
+]]
+
 -- Does drawing in the skybox pass put a quad BEHIND the world? A sky effect
 -- cannot depth-test its way there: the depth texture caps at 4000 units, so
 -- distant geometry is indistinguishable from sky. Drawing before the main
@@ -123,6 +206,8 @@ local VARIANTS = {
   uv = {src = UV},
   tint = {src = TINT},
   depth = {src = DEPTH, sceneDepth = true},
+  normal = {src = NORMAL, sceneDepth = true, ver = "30"},
+  lod = {src = LOD, sceneDepth = true, ver = "30"},
   depthwrite = {src = DEPTHWRITE, depth = true, ver = "30"},
   -- Same shader, drawn inside the 3D scene instead of in post. If DEPTH0 is
   -- ever going to be z-tested, it is here: RenderScreenspaceEffects runs after
@@ -471,7 +556,7 @@ concommand.Add("claude_shader_test", function(ply, _, args)
   local ver = args[3]
   local variant = VARIANTS[which]
   if not variant then
-    print("[gm-claude] Usage: claude_shader_test <red|uv|tint|depth|depthwrite|depthwrite3d|sky|sky3d> [seconds] [20b|30]")
+    print("[gm-claude] Usage: claude_shader_test <red|uv|tint|depth|normal|lod|depthwrite|depthwrite3d|sky|sky3d> [seconds] [20b|30]")
     return
   end
   ver = ver or variant.ver
@@ -484,6 +569,19 @@ concommand.Add("claude_shader_test", function(ply, _, args)
     print("[gm-claude] Depth ramps red(100u) -> green(4000u) left to right. Aim at a wall:")
     print("[gm-claude]   WORKS  = everything past the wall's distance is cut away, boundary moves as you walk")
     print("[gm-claude]   BROKEN = full gradient covers the screen regardless")
+  end
+  if which == "lod" then
+    print("[gm-claude] Comparing tex2D against tex2Dlod on the depth RT:")
+    print("[gm-claude]   GREEN = they agree, tex2Dlod is safe inside a march")
+    print("[gm-claude]   RED   = tex2Dlod returns nothing. Every marching depth shader is broken.")
+    print("[gm-claude]   BLUE  = they disagree")
+  end
+  if which == "normal" then
+    print("[gm-claude] Normals reconstructed from depth, as colour. Look at a FLOOR:")
+    print("[gm-claude]   WORKS  = floor is pale blue (0.5,0.5,1), walls pink/green, sky black")
+    print("[gm-claude]   BROKEN = one flat colour everywhere that SHIFTS AS YOU TURN.")
+    print("[gm-claude]            That is n = -forward: depth is too coarse to tell surfaces")
+    print("[gm-claude]            apart, so every depth-derived effect silently does nothing.")
   end
   if which == "sky" or which == "sky3d" then
     print("[gm-claude] Look at the sky AND at distant geometry:")
@@ -511,4 +609,4 @@ concommand.Add("claude_shader_test", function(ply, _, args)
       S.Show(result.hash, seconds, {who}, variant.sceneDepth, variant.drawHook)
     end)
   end)
-end, nil, "Compile and display a test screenspace shader. Usage: claude_shader_test <red|uv|tint|depth> [seconds] [20b|30]")
+end, nil, "Compile and display a test screenspace shader. Usage: claude_shader_test <red|uv|tint|depth|normal> [seconds] [20b|30]")

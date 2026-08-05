@@ -12,6 +12,8 @@ include("claude/history.lua") -- per-player recent creations, for !edit
 include("claude/services/mount.lua")
 ---@module "lua.claude.services.shader"
 include("claude/services/shader.lua")
+---@module "lua.claude.services.chatbox"
+include("claude/services/chatbox.lua")
 ---@module "lua.claude.services.shader-test"
 include("claude/services/shader-test.lua")
 ---@module "lua.claude.services.classify-eval"

@@ -1,5 +1,11 @@
+-- Guarded: the chatbox includes this for the command manifest, and a second copy
+-- would be an empty registry. Set before anything else so a command file that
+-- includes the runner back cannot re-enter.
+if _G.GilbCommandRunner then return _G.GilbCommandRunner end
+
 local runner = {}
 runner.commands = {}
+_G.GilbCommandRunner = runner
 
 function runner.trigger(text)
     return text:Split(" ")[1]:sub(2)
@@ -83,6 +89,26 @@ function runner.consume(player, chat)
     end
 
     return true, commandInfo
+end
+
+--- The parts of the registry a client needs to highlight and autocomplete:
+--- names and arg shapes, never the run functions.
+function runner.manifest()
+    local out = {}
+    for trigger, command in pairs(runner.commands) do
+        local args = {}
+        for i, arg in ipairs(command.args or {}) do
+            args[i] = {name = arg.name, type = arg.type, consumeAll = arg.consumeAll}
+        end
+        out[#out + 1] = {
+            trigger = trigger,
+            description = command.description,
+            args = args,
+        }
+    end
+
+    table.sort(out, function(a, b) return a.trigger < b.trigger end)
+    return out
 end
 
 return runner

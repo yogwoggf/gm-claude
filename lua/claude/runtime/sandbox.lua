@@ -8,69 +8,18 @@ local analyze = include("claude/runtime/analysis.lua")
 local repair = include("claude/runtime/repair.lua") -- runtime error bus; wrapped callbacks report here
 ---@module "lua.claude.mock.init"
 local mock = include("claude/mock/init.lua") -- records registered SENTs/SWEPs for the exercise pass
+---@module "lua.claude.runtime.error-capture"
+local capture = include("claude/runtime/error-capture.lua")
 
--- ------------------------------------------------------------ error capture ----
+local wrapCallback = capture.wrap
 
---- tostring that can't itself throw and won't dump a wall of text into an error
---- report (a bad __tostring or a huge table shouldn't drown the useful message).
-local function tostringSafe(v)
-  local ok, s = pcall(tostring, v)
-  if not ok then s = "<tostring error>" end
-  if #s > 80 then s = s:sub(1, 77) .. "..." end
-  return s
-end
-
---- Snapshot the locals of the failing frame(s) that live in the generated chunk.
---- Runs inside the xpcall message handler (before the stack unwinds), so the exact
---- values at the moment of the error are still live — this is what turns "compare
---- nil with number at line 14" into "dmg was nil, base was 25". Best-effort.
-local function snapshotLocals(promptId)
-  local out = {}
-  for level = 2, 16 do
-    local info = debug.getinfo(level, "Sln")
-    if not info then break end
-    local src = tostring(info.short_src or info.source or "")
-    if src == promptId or src:find(promptId, 1, true) then
-      local parts = {}
-      for i = 1, 40 do
-        local name, value = debug.getlocal(level, i)
-        if not name then break end
-        if name:sub(1, 1) ~= "(" then -- skip (temporary) / (for ...) internals
-          parts[#parts + 1] = string.format("%s = %s", name, tostringSafe(value))
-        end
-      end
-      out[#out + 1] = string.format("line %d: %s", info.currentline or -1, table.concat(parts, ", "))
-    end
-  end
-  return table.concat(out, "\n")
-end
-
---- Wrap a callback so that when it errors at runtime (deferred, outside the coder's
---- synchronous run), the failure is caught, attributed to `promptId`, enriched with
---- a traceback + locals, and routed to the repair bus instead of vanishing into the
---- console. The error is swallowed (the game keeps running) since we've recorded it.
---- Return values pass through untouched on success, so wrapped hooks/methods behave
---- exactly as before when they don't error.
-local function wrapCallback(promptId, realm, fn)
-  if type(fn) ~= "function" then return fn end
-  local function handler(err)
-    local okCap, detail = pcall(function()
-      local locals = snapshotLocals(promptId)
-      local trace = debug.traceback(tostring(err), 2)
-      return locals ~= "" and (trace .. "\nLocals at error:\n" .. locals) or trace
-    end)
-    -- Always surface it in the console, even for unregistered chunks (test envs,
-    -- the dev rerun command) where the repair bus will ignore it — an error we've
-    -- swallowed must never disappear without a trace.
-    print(string.format("[gm-claude] Deferred %s error in %s: %s", realm, promptId, tostring(err)))
-    pcall(repair.reportError, repair, promptId, realm, tostring(err), okCap and detail or nil)
-    return err
-  end
-  return function(...)
-    local res = { xpcall(fn, handler, ...) } -- LuaJIT xpcall forwards args
-    if res[1] then return unpack(res, 2) end
-  end
-end
+capture.setSink(function(promptId, realm, err, detail)
+  -- Always surface it in the console, even for unregistered chunks (test envs,
+  -- the dev rerun command) where the repair bus will ignore it — an error we've
+  -- swallowed must never disappear without a trace.
+  print(string.format("[gm-claude] Deferred %s error in %s: %s", realm, promptId, err))
+  repair:reportError(promptId, realm, err, detail)
+end)
 
 --- A library table proxied so a few functions are overridden while everything else
 --- falls through to the real library (hook.Remove, hook.Run, ... stay intact).
