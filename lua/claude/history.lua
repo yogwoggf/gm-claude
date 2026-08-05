@@ -28,6 +28,22 @@ function History:record(promptId, realm, code)
   table.insert(rec.artifacts, {realm = realm, code = code})
 end
 
+--- Record HLSL that compiled and mounted. Shaders live in the same artifact
+--- list as Lua so snapshot/reset/fallback/persist carry them for free — without
+--- this an !edit sees the draw code but not the shader it draws.
+function History:recordShader(promptId, name, source, material)
+  local rec = active[promptId]
+  if not rec then return end
+  -- Same shader re-compiled during a build: keep one entry, newest source.
+  for _, art in ipairs(rec.artifacts) do
+    if art.shader and art.name == name then
+      art.code, art.material = source, material
+      return
+    end
+  end
+  table.insert(rec.artifacts, {shader = true, name = name, code = source, material = material})
+end
+
 --- The artifacts that represent this record's current script — its own if it has
 --- any, else the fallback stashed by a reset (so a fix pass that recorded nothing
 --- doesn't erase the last-known-good version).
@@ -47,9 +63,12 @@ function History:snapshot(promptId)
   local source = effectiveArtifacts(rec)
   if #source == 0 then return nil end
 
+  -- Shallow copy whole artifacts: shader entries carry name/material too.
   local artifacts = {}
   for i, art in ipairs(source) do
-    artifacts[i] = {realm = art.realm, code = art.code}
+    local copy = {}
+    for k, v in pairs(art) do copy[k] = v end
+    artifacts[i] = copy
   end
   return {originalPrompt = rec.prompt, artifacts = artifacts}
 end
@@ -103,7 +122,12 @@ end
 function History:persist(rec)
   local parts = {}
   for _, art in ipairs(rec.artifacts) do
-    table.insert(parts, string.format("-- [%s]\n%s", art.realm, art.code))
+    if art.shader then
+      table.insert(parts, string.format("-- [shader hlsl: %s -> %s]\n%s",
+        art.name, art.material, art.code))
+    else
+      table.insert(parts, string.format("-- [%s]\n%s", art.realm, art.code))
+    end
   end
   file.CreateDir("prompt-lua")
   file.Write("prompt-lua/" .. rec.promptId .. ".txt", table.concat(parts, "\n\n"))

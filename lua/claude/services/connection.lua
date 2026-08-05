@@ -2,9 +2,9 @@
 -- There are two correlation styles:
 --   * id-based handlers: long-lived streams. A prompt/agent receives many events
 --     over its lifetime, all routed by the `id` field on incoming messages.
---   * type-based RPC: one-shot request/response (credits, embeddings). Each pending
---     request is queued FIFO under its expected response `type`, so concurrent
---     requests resolve in order instead of clobbering a single shared callback slot.
+--   * type-based RPC: one-shot request/response (credits). Each pending request is
+--     queued FIFO under its expected response `type`, so concurrent requests
+--     resolve in order instead of clobbering a single shared callback slot.
 
 require("gwsockets")
 

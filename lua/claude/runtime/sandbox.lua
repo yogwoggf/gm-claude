@@ -114,13 +114,9 @@ hook.Add("PlayerInitialSpawn", "claude.prevent-transmission", function(ply)
   end
 end)
 
-net.Receive("claude.requestlua", function(len, ply)
-  -- Also ensure they have everything mounted!
-  for _, id in ipairs(mount.LoadedAddons) do
-    mount.ForcePlayerMount(ply, id)
-  end
-
-  -- This client wants to get all the Lua code that Claude has sent to clients so far, so we can run it and make sure our clientside environment is up to date
+-- This client wants to get all the Lua code that Claude has sent to clients so far, so we can run it and make sure our clientside environment is up to date
+local function syncClientLua(ply)
+  if not IsValid(ply) then return end
   ply:SendLua([[notification.AddProgress("claude", "Syncing Claude Lua code...", 0)]])
   -- cant overwhelm them so one at a time with a small delay
   local delay = 0
@@ -156,6 +152,27 @@ net.Receive("claude.requestlua", function(len, ply)
         end
       end)
     end
+  end)
+end
+
+net.Receive("claude.requestlua", function(len, ply)
+  -- Also ensure they have everything mounted!
+  for _, id in ipairs(mount.LoadedAddons) do
+    mount.ForcePlayerMount(ply, id)
+  end
+
+  -- Shaders BEFORE Lua, always. Material() permanently caches the error material
+  -- for a name that is not mounted yet, so an effect replayed ahead of its GMA
+  -- stays broken for this client until they rejoin.
+  local shader = _G.ClaudeShader
+  if not shader or not shader.SendAll then
+    syncClientLua(ply)
+    return
+  end
+
+  ply:SendLua([[notification.AddProgress("claude", "Syncing Claude shaders...", 0)]])
+  shader.SendAll(ply, function()
+    syncClientLua(ply)
   end)
 end)
 

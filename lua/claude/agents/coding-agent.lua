@@ -11,6 +11,8 @@ local defaultTools = include("claude/tools/asset-tools.lua")
 local luaTools = include("claude/tools/lua-tools.lua")
 ---@module "lua.claude.tools.notify-tool"
 local notifyTool = include("claude/tools/notify-tool.lua")
+---@module "lua.claude.tools.shader-tool"
+local shaderTool = include("claude/tools/shader-tool.lua")
 ---@module "lua.claude.wiki.tool"
 local wikiTool = include("claude/wiki/tool.lua")
 
@@ -39,6 +41,19 @@ local CodingAgent = setmetatable({}, {__index = Agent})
 CodingAgent.__index = CodingAgent
 
 --- @param opts table { api, player, task, kind?, promptId?, editContext? }
+--- Is a capability in this coder's set, primary or secondary?
+--- @param kind string
+--- @return boolean
+function CodingAgent:has(kind)
+  local caps = self.capabilities
+  if not caps then return false end
+  if caps.primary == kind then return true end
+  for _, k in ipairs(caps.secondary or {}) do
+    if k == kind then return true end
+  end
+  return false
+end
+
 function CodingAgent.new(opts)
   local self = setmetatable({}, CodingAgent)
   local cfg = demand:current().coding -- models + reasoning scale with server load
@@ -66,7 +81,12 @@ function CodingAgent.new(opts)
 
   self.player = opts.player
   self.task = opts.task
-  self.kind = opts.kind -- which playbook this deliverable needs
+  -- Capabilities: one primary (the deliverable) plus supporting ones. `kind` stays
+  -- the primary and remains the partition key for memory, the asset palette and
+  -- distillation, so none of that had to change.
+  local caps = opts.capabilities or {primary = opts.kind or "logic", secondary = {}}
+  self.capabilities = caps
+  self.kind = caps.primary
   self.oneShot = opts.oneShot -- no planner: task is the player's verbatim request
   self.successCriteria = opts.successCriteria -- observable definition of done, from the planner
   self.editContext = opts.editContext -- set when this is an !edit; carries the existing code
@@ -83,7 +103,7 @@ function CodingAgent.new(opts)
   -- so the provider's prefix cache can cover this block.
   self:addMessage({role = "system", content = {{type = "text", text = systemPrompt}}})
   self:addSystem(codingPrompt)
-  self:addSystem(playbooks.get(self.kind))
+  self:addSystem(playbooks.assemble(self.kind, caps.secondary))
   self:addSystem(assetPalette.get(self.kind))
 
   -- PROVEN only, cached: stays prefix-stable.
@@ -111,6 +131,9 @@ function CodingAgent.new(opts)
   self:addTool(luaTools.shared) -- run_shared_lua
   self:addTool(notifyTool)
   self:addTool(wikiTool) -- wiki_search
+  -- Tools are the UNION over capabilities, so a swep that needs a material gets
+  -- the compiler without the request having to classify as `shader`.
+  if self:has("shader") then self:addTool(shaderTool) end
   return self
 end
 

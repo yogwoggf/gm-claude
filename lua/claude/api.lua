@@ -67,62 +67,56 @@ return {
   sendPrompt = function(self, player, prompt, callback, opts)
     opts = opts or {}
 
-    local agent
-    if self.ONE_SHOT:GetBool() then
-      agent = CodingAgent.new({
-        api = self,
-        player = player,
-        task = prompt, -- verbatim: the coder sees exactly what the player typed
-        kind = classify:playbook(opts.editContext and opts.editContext.originalPrompt or prompt),
-        oneShot = true,
-        promptId = opts.promptId,
-        editContext = opts.editContext,
-      })
-    else
-      agent = PlannerAgent.new({
+    local label = opts.editContext and opts.editContext.originalPrompt or prompt
+
+    -- Everything below is identical on both routes; only the agent differs. The
+    -- one-shot route needs its capabilities resolved first (they pick the playbook
+    -- AND the tools), so it is built inside the classify callback.
+    local function dispatch(agent)
+      history:begin(player, agent.promptId, label)
+      repair:register(agent.promptId, player)
+
+      self:launchAgent(agent, function(result, ag)
+        history:finish(ag.promptId)
+        -- The planner finishes with a summary string; a coding agent finishes with an
+        -- outcome table. Normalize so the chat entry point stays route-agnostic.
+        if istable(result) then
+          result = result.summary or result.error or ""
+        end
+        callback(result, ag.promptId)
+      end)
+    end
+
+    if not self.ONE_SHOT:GetBool() then
+      dispatch(PlannerAgent.new({
         api = self,
         player = player,
         prompt = prompt,
         promptId = opts.promptId,
         editContext = opts.editContext,
-      })
+      }))
+      return
     end
 
-    local label = opts.editContext and opts.editContext.originalPrompt or prompt
-    history:begin(player, agent.promptId, label)
-    repair:register(agent.promptId, player)
-
-    self:launchAgent(agent, function(result, ag)
-      history:finish(ag.promptId)
-      -- The planner finishes with a summary string; a coding agent finishes with an
-      -- outcome table. Normalize so the chat entry point stays route-agnostic.
-      if istable(result) then
-        result = result.summary or result.error or ""
-      end
-      callback(result, ag.promptId)
-    end)
-  end,
-
-  addLiveEmbedding = function(self, example, callback)
-    self.connection:request("add-embedding", {example = example}, "add-embedding-response", function(data)
-      callback(data.success, data.message)
-    end)
-  end,
-
-  deleteEmbedding = function(self, prompt, callback)
-    -- Callers may fire-and-forget; only queue a waiter when they actually want the result.
-    if callback then
-      self.connection:request("delete-embedding", {prompt = prompt}, "add-embedding-response", function(data)
-        callback(data.success, data.message)
-      end)
-    else
-      self.connection:send("delete-embedding", {prompt = prompt})
-    end
-  end,
-
-  getAllEmbeddings = function(self, callback)
-    self.connection:request("get-all-embeddings", {}, "get-all-embeddings-response", function(data)
-      callback(data.examples)
+    -- One extra small-model hop before any code is written. classify:capabilities
+    -- always calls back exactly once with a usable set, degrading to keyword rules
+    -- on timeout or bad output, so this cannot stall a build.
+    local classifyStart = SysTime()
+    classify:capabilities(self, label, function(caps, source)
+      -- Timing is here so a persistent "(keyword)" is diagnosable: it means the
+      -- classifier is timing out rather than being unavailable.
+      print(string.format("[gm-claude] Capabilities (%s, %.1fs): %s%s", source,
+        SysTime() - classifyStart, caps.primary,
+        #caps.secondary > 0 and (" + " .. table.concat(caps.secondary, ", ")) or ""))
+      dispatch(CodingAgent.new({
+        api = self,
+        player = player,
+        task = prompt, -- verbatim: the coder sees exactly what the player typed
+        capabilities = caps,
+        oneShot = true,
+        promptId = opts.promptId,
+        editContext = opts.editContext,
+      }))
     end)
   end,
 

@@ -13,6 +13,9 @@ local MODEL_PROVIDER_FORCE = {
   ["openai/gpt-5.6-luna"] = {
     "openai"
   },
+  ["openai/gpt-5.6-terra"] = {
+    "openai"
+  },
   ["google/gemini-3-flash-preview:nitro"] = {
     "google-ai-studio",
   },

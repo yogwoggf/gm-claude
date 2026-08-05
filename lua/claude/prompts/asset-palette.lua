@@ -76,6 +76,10 @@ local SECTIONS_BY_KIND = {
   swep   = {"viewmodels", "worldmodels", "gunSounds", "impactSounds", "materials"},
   sent   = {"props", "impactSounds", "materials", "uiSounds"},
   effect = {"materials", "impactSounds", "props"},
+  -- Screenspace shaders sample the framebuffer, not assets; the palette is
+  -- almost irrelevant, but a mapping is needed or `get` falls back to `logic`
+  -- and injects props/sounds this kind will never use.
+  shader = {"materials"},
   ui     = {"uiSounds", "materials"},
   logic  = {"props", "impactSounds", "uiSounds"},
 }

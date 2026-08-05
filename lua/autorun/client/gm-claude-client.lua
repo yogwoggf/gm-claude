@@ -1,6 +1,5 @@
 include("claude/services/mount.lua")
-include("claude/services/embeddings.lua")
-include("claude/tests.lua")
+include("claude/services/shader.lua")
 
 -- Chunk names (promptIds) of AI-generated code this client has run, so the error
 -- reporters can tell which errors are ours and worth siphoning to the server. The
@@ -154,6 +153,9 @@ local function delaySplash()
   if splashDone or splashFlightStart > 0 then return end
   splashReadyAt = CurTime() + SPLASH_HOLD
 end
+
+-- Shader GMAs stream before the Lua does, so they have to hold the splash too.
+hook.Add("ClaudeSyncActivity", "claude.splash", delaySplash)
 
 net.Receive("claude.runlua", function()
   local code = net.ReadString()

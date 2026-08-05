@@ -50,7 +50,12 @@ local dispatchTool = Tool.new({
             kind = {
               type = "string",
               enum = playbooks.kinds,
-              description = "What kind of thing this task builds. This selects the specialist playbook the coder is given, so pick the one matching the PRIMARY deliverable: 'swep' = a scripted weapon; 'sent' = a scripted entity; 'effect' = visual effects (beams, glows, particles, screen effects); 'ui' = HUDs, Derma panels, DHTML; 'logic' = game logic, spawning, physics, damage, hooks, rules. If a task would need two, split it into two agents or pick the one that dominates."
+              description = "The PRIMARY deliverable of this task — the thing that exists when it is done. 'swep' = a scripted weapon; 'sent' = a scripted entity; 'effect' = visual effects (beams, glows, particles); 'shader' = custom HLSL, screenspace or on a material; 'ui' = HUDs, Derma panels, DHTML; 'logic' = game logic, spawning, physics, damage, hooks, rules."
+            },
+            alsoNeeds = {
+              type = "array",
+              items = {type = "string", enum = playbooks.kinds},
+              description = "Up to 2 SUPPORTING capabilities this task also needs — techniques in service of the deliverable, not separate deliverables. A weapon that spawns particles is kind 'swep' with alsoNeeds ['effect']; a prop with a dissolving material is 'sent' with alsoNeeds ['shader']. Leave empty when the task needs nothing beyond its kind. Do NOT list the kind again here."
             },
             successCriteria = {
               type = "array",
@@ -108,7 +113,12 @@ local dispatchTool = Tool.new({
         api = planner.api,
         player = planner.player,
         task = spec.task or "",
-        kind = spec.kind, -- selects the coder's playbook; falls back to "logic"
+        -- Primary deliverable plus supporting capabilities: picks the coder's
+        -- playbooks AND its tools. Falls back to "logic" when the planner omits it.
+        capabilities = {
+          primary = spec.kind or "logic",
+          secondary = istable(spec.alsoNeeds) and spec.alsoNeeds or {},
+        },
         successCriteria = spec.successCriteria, -- observable definition of done; guides the build
         promptId = planner.promptId,     -- group the coder's artifacts under this creation
         -- On a corrective re-dispatch, the live code so far; else the !edit context
